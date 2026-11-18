@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="{{LANG}}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="author" content="Rebo">
+<meta name="midas-token" content="{{TOKEN}}">
+<title>Midas Companion</title>
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="sky" aria-hidden="true"><div class="aura a1"></div><div class="aura a2"></div><div class="vignette"></div></div>
+<header class="top">
+  <div class="top-in">
+    <div class="brand">
+      <img src="logo.png" alt="" width="34" height="34">
+      <span class="brand-name">Midas <b>Companion</b></span>
+      <span class="badge" id="ver"></span>
+    </div>
+    <div class="top-mid"><span class="pill" id="state"><i class="dot"></i><span id="state-t"></span></span></div>
+    <button type="button" class="btn gold" id="b-send"></button>
+  </div>
+</header>
+<main class="wrap">
+  <section class="card orn panel" aria-labelledby="h-setup">
+    <div class="panel-h"><h2 id="h-setup"></h2><span class="p-sub" id="setup-sub"></span></div>
+    <ol class="checks" id="checks"></ol>
+    <div class="folder" id="folder" hidden>
+      <p class="muted" id="folder-t"></p>
+      <div class="row">
+        <input type="text" id="folder-in" spellcheck="false" autocomplete="off">
+        <button type="button" class="btn sm" id="b-folder-set"></button>
+        <button type="button" class="btn sm" id="b-folder-pick"></button>
+      </div>
+      <p class="msg" id="folder-msg" role="status"></p>
+    </div>
+  </section>
+
+  <div class="grid">
+    <section class="card orn panel" aria-labelledby="h-markets">
+      <div class="panel-h"><h2 id="h-markets"></h2><span class="p-sub" id="markets-sub"></span></div>
+      <div class="tbl-wrap">
+        <table class="tbl" id="markets">
+          <thead><tr><th id="th-m"></th><th id="th-seen"></th><th id="th-up"></th><th id="th-srv"></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p class="muted empty" id="markets-empty" hidden></p>
+    </section>
+
+    <section class="card orn panel" aria-labelledby="h-actions">
+      <div class="panel-h"><h2 id="h-actions"></h2></div>
+      <div class="actions">
+        <label class="switch"><input type="checkbox" id="sw-prices"><span class="sl"></span><span id="sw-prices-t"></span></label>
+        <label class="switch"><input type="checkbox" id="sw-auto"><span class="sl"></span><span id="sw-auto-t"></span></label>
+        <div class="row">
+          <button type="button" class="btn sm" id="b-log"></button>
+          <button type="button" class="btn sm" id="b-data"></button>
+          <button type="button" class="btn sm" id="b-pick2"></button>
+        </div>
+      </div>
+      <dl class="facts" id="facts"></dl>
+    </section>
+  </div>
+
+  <section class="card orn panel" aria-labelledby="h-log">
+    <div class="panel-h"><h2 id="h-log"></h2><span class="p-sub" id="log-sub"></span></div>
+    <div class="log" id="log" role="log" aria-live="polite" tabindex="0"></div>
+  </section>
+
+  <section class="info">
+    <p class="kick" id="info-k"></p>
+    <p class="lead" id="info-t"></p>
+    <div class="row">
+      <button type="button" class="pill link" id="l-cf">CurseForge · Midas</button>
+      <button type="button" class="pill link" id="l-web">midasmarket.app</button>
+    </div>
+    <div class="cid">
+      <span class="muted" id="cid-l"></span>
+      <code id="cid" tabindex="0"></code>
+      <button type="button" class="btn sm" id="b-cid"></button>
+    </div>
+    <p class="legal" id="cid-t"></p>
+    <p class="legal" id="info-legal"></p>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
