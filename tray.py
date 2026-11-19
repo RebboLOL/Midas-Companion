@@ -49,13 +49,15 @@ TEXT = {
            "log": "Log öffnen", "folder": "Ordner öffnen", "quit": "Beenden",
            "idle": "bereit", "nowow": "keine WoW-Installation gefunden",
            "prices": "Serverpreise laden", "plast": "Serverpreise: {}", "poff": "aus",
-           "open": "Öffnen", "pick": "World-of-Warcraft-Ordner wählen"},
+           "open": "Öffnen", "pick": "World-of-Warcraft-Ordner wählen",
+           "kind_full": "voller Scan", "kind_prices": "Preis-Scan"},
     "en": {"last": "Last upload: {}", "never": "none yet", "count": "Sent: {}",
            "state": "Status: {}", "send": "Send now", "auto": "Start with Windows",
            "log": "Open log", "folder": "Open folder", "quit": "Quit",
            "idle": "ready", "nowow": "no WoW install found",
            "prices": "Load server prices", "plast": "Server prices: {}", "poff": "off",
-           "open": "Open", "pick": "Choose the World of Warcraft folder"},
+           "open": "Open", "pick": "Choose the World of Warcraft folder",
+           "kind_full": "full scan", "kind_prices": "price scan"},
 }
 
 
@@ -397,6 +399,7 @@ class SvCache:
     def __init__(self):
         self.d = {}
         self.lock = threading.Lock()
+        self.wtf = {}                       # realm folders per flavor (30 s, see U.extra_markets)
 
     def get(self, path):
         key = str(path)
@@ -458,11 +461,17 @@ def _copy(d):
     return dict(d) if isinstance(d, dict) else {}
 
 
-def build_status(roots, st, url, cache, now=None):
-    """Everything the window shows, as plain JSON data."""
+def build_status(roots, st, url, cache, now=None, manual=None):
+    """Everything the window shows, as plain JSON data. Markets carry their
+    source: "seen" (Midas), "wtf" (game folder) or "manual" (added by hand)."""
     now = int(time.time()) if now is None else now
+    manual = list(st.get("manual_markets") or []) if manual is None else list(manual)
     flavors, share_on, any_midas_ok = [], False, False
     markets = {}
+    base_url = U.export_url(url)
+
+    def server_list():                      # cache only: the window never asks the server
+        return U.server_forever_markets(base_url, st, now, fetch=False) if st.get("markets_list") else []
     for root in roots:
         for fl in U.FLAVORS:
             base = Path(root) / fl
@@ -477,6 +486,7 @@ def build_status(roots, st, url, cache, now=None):
             any_midas_ok |= midas_ok
             fshare = None
             accounts = 0
+            fseen = {}
             for f in U.sv_sources([root], (fl,)):
                 summ = cache.get(f)
                 if not summ or not summ["present"]:
@@ -487,31 +497,51 @@ def build_status(roots, st, url, cache, now=None):
                     if now - mk["last"] > U.SEEN_DAYS * 86400:
                         continue
                     k = U.raw_key(mk)
+                    if k not in fseen or fseen[k]["last"] < mk["last"]:
+                        fseen[k] = mk
                     if k not in markets or markets[k]["last"] < mk["last"]:
-                        markets[k] = dict(mk, flavor=fl)
+                        markets[k] = dict(mk, flavor=fl, src="seen")
             share_on |= bool(fshare)
             pdirs = U.flavor_price_dirs(base) if fl in U.PRICE_FLAVORS else []
+            finfo = None
+            if fl in U.PRICE_FLAVORS:
+                try:
+                    extra, finfo = U.extra_markets(root, fl, list(fseen.values()), manual, now,
+                                                     getattr(cache, "wtf", None), server_list)
+                except OSError:
+                    extra = []
+                for mk in extra:
+                    k = U.raw_key(mk)
+                    if k not in markets:
+                        markets[k] = dict(mk, flavor=fl, last=0 if mk["src"] == "manual" else mk["last"])
             flavors.append({
                 "flavor": fl, "label": FLAVOR_LABEL.get(fl, fl.strip("_")), "root": str(root),
                 "midas": midas_v, "midas_ok": midas_ok,
                 "midas_prices": bool(toc) and U.PRICE_FILE.lower() in toc["files"],
                 "old_uplink": old["version"] if old else None,
                 "share": fshare, "accounts": accounts,
-                "prices": [prices_file_info(d) for d in pdirs]})
-    base_url = U.export_url(url)
+                "prices": [prices_file_info(d) for d in pdirs],
+                "found": ({"region": finfo["region"], "realms": len(finfo["realms"]),
+                           "numbered": finfo["numbered"], "no_region": finfo["no_region"],
+                           "listed": finfo["listed"]}
+                          if finfo else None)})
     pmap = _copy(st.get("prices_market"))
     pinfo = _copy(st.get("prices_info"))
     um = _copy(st.get("upload_markets"))
     rows = []
-    for k, mk in sorted(markets.items(), key=lambda kv: -kv[1]["last"]):
+    order = {"seen": 0, "manual": 1, "wtf": 2, "list": 3}
+    for k, mk in sorted(markets.items(), key=lambda kv: (order[kv[1]["src"]], -kv[1]["last"])):
         server = pmap.get(U.query_key(base_url, mk)) if base_url else None
         info = pinfo.get(server) if server else None
         up = um.get("|".join(k))
         rows.append({"client": mk["client"], "region": mk["region"], "realm": mk["realm"],
                      "faction": mk["faction"], "ruleset": mk.get("ruleset"), "flavor": mk["flavor"],
-                     "last_seen": mk["last"], "server": server,
+                     "last_seen": mk["last"] if mk["src"] == "seen" else 0,
+                     "folder_at": mk["last"] if mk["src"] == "wtf" else 0,
+                     "src": mk["src"], "server": server,
                      "server_ts": info["ts"] if info else 0, "items": info["items"] if info else 0,
-                     "upload_at": up["at"] if up else 0, "upload_ts": up["ts"] if up else 0})
+                     "upload_at": up["at"] if up else 0, "upload_ts": up["ts"] if up else 0,
+                     "upload_kind": up.get("kind", "full") if up else None})
     stats = _copy(st.get("stats"))
     written = [p for f in flavors for p in f["prices"] if p["app"]]
     return {
@@ -522,11 +552,17 @@ def build_status(roots, st, url, cache, now=None):
         "midas_ok": any_midas_ok,
         "share_on": share_on,
         "uploads": stats.get("uploads", 0), "last_upload": stats.get("last", 0),
+        "last_kind": st.get("last_upload_kind") if st.get("last_upload_kind") in ("full", "prices") else None,
+        "last_full": stats.get("last_full", 0), "last_prices": stats.get("last_prices", 0),
         "prices_enabled": st.get("prices_enabled", True) is True,
         "prices_last": st.get("prices_last", 0),
         "prices_written": bool(written),
         "prices_with_data": any((p["markets"] or 0) != 0 for p in written),
         "markets": rows[:40],
+        "manual": [{"id": U.manual_id(m), "flavor": m["flavor"],
+                    "label": FLAVOR_LABEL.get(m["flavor"], m["flavor"]), "region": m["region"],
+                    "realm": m["realm"], "faction": m["faction"]} for m in manual],
+        "manual_max": U.MANUAL_MAX,
     }
 
 
@@ -551,6 +587,7 @@ class App:
         self.cache = SvCache()
         self._dir_req = []
         self._lock = threading.Lock()
+        self._state_lock = threading.Lock()          # watcher (re)creation vs. direct state writes
         self._pick_lock = threading.Lock()
         self._last_open = 0.0
         self.roots = []
@@ -579,13 +616,16 @@ class App:
             reqs, self._dir_req = self._dir_req, []
         if not reqs:
             return
-        st = self.state()
-        for d in reqs:
-            if d not in st["wow_dirs"]:
-                st["wow_dirs"].append(d)
-                self.log.info(f"World of Warcraft folder added: {d}")
-        U.save_state(st)
-        self.watcher = None                          # rebuilt with the new roots
+        with self._state_lock:
+            if self.watcher:
+                self.watcher._apply_request()       # pending window changes go into the state first
+            st = self.state()
+            for d in reqs:
+                if d not in st["wow_dirs"]:
+                    st["wow_dirs"].append(d)
+                    self.log.info(f"World of Warcraft folder added: {d}")
+            U.save_state(st)
+            self.watcher = None                      # rebuilt with the new roots
 
     def loop(self):
         self.log.info(f"{APP_NAME} {U.VERSION} start, url {self.url}")
@@ -597,7 +637,8 @@ class App:
                     self.roots = roots
                     if roots:
                         self.log.info("watching: " + "; ".join(str(r) for r in roots))
-                        self.watcher = U.Watcher(roots, U.Sender(self.url), self.note, self.interval)
+                        with self._state_lock:              # no direct state write in between
+                            self.watcher = U.Watcher(roots, U.Sender(self.url), self.note, self.interval)
                     else:
                         self.note(self.t["nowow"])
                         self.wake.wait(300)
@@ -616,9 +657,55 @@ class App:
             self.log.info("stop")
 
     # ---- window backend (ui_server) ---------------------------------------- #
+    def manual_markets(self):
+        w = self.watcher
+        return w.manual_markets() if w else list(U.load_state()["manual_markets"])
+
+    def _write_state(self, key, value):
+        """Change one state field: through the watcher when it runs (its thread owns
+        the state), otherwise directly - under the same lock that creates a watcher,
+        so a new watcher always loads the change and never overwrites it."""
+        with self._state_lock:
+            w = self.watcher
+            if w is not None:
+                (w.set_manual if key == "manual_markets" else w.set_prices)(value)
+            else:
+                st = U.load_state()
+                st[key] = value
+                U.save_state(st)
+        if w is not None:
+            self.wake.set()
+        return w is None
+
+    def set_manual(self, markets):
+        self._write_state("manual_markets", list(markets))
+
+    def add_market(self, data):
+        with self._lock:
+            try:
+                new = U.add_manual_market(self.manual_markets(), {
+                    "flavor": data.get("flavor"), "region": data.get("region"),
+                    "realm": data.get("realm"), "faction": data.get("faction")})
+            except ValueError as e:
+                return {"ok": False, "error": str(e)}
+            self.set_manual(new)
+        m = new[-1]
+        self.log.info(f'market added by hand: {m["flavor"]} {m["region"]}/{m["realm"]}/{m["faction"]}')
+        return {"ok": True, "id": U.manual_id(m)}
+
+    def remove_market(self, mid):
+        with self._lock:
+            cur = self.manual_markets()
+            new = U.remove_manual_market(cur, mid) if isinstance(mid, str) else cur
+            if len(new) == len(cur):
+                return {"ok": False, "error": "unknown"}
+            self.set_manual(new)
+        self.log.info("market added by hand removed")
+        return {"ok": True}
+
     def status_data(self):
         st = self.state()
-        d = build_status(list(self.roots), st, self.url, self.cache)
+        d = build_status(list(self.roots), st, self.url, self.cache, manual=self.manual_markets())
         d["status"] = self.status
         d["autostart"] = autostart_enabled()
         d["packaged"] = package_env.packaged()
@@ -663,6 +750,10 @@ class App:
             if not p:
                 return {"ok": False, "error": "cancel"}
             return self.add_wow_dir(p)
+        if name == "market_add":
+            return self.add_market(data)
+        if name == "market_del":
+            return self.remove_market(data.get("id"))
         if name == "open":
             what = data.get("what")
             if what == "log":
@@ -722,13 +813,7 @@ class App:
         return U.load_state()["prices_enabled"]
 
     def set_prices(self, on):
-        if self.watcher:
-            self.watcher.set_prices(on)              # applied by the uploader thread
-            self.wake.set()
-        else:                                        # no loop running: write directly
-            st = U.load_state()
-            st["prices_enabled"] = on
-            U.save_state(st)
+        if self._write_state("prices_enabled", bool(on)):    # no loop running: written directly
             self.log.info(f"server prices {'on' if on else 'off'}")
 
     def toggle_prices(self, icon=None, item=None):
@@ -760,6 +845,9 @@ class App:
         st = self.state()
         last = st.get("stats", {}).get("last") or 0
         when = time.strftime("%d.%m. %H:%M", time.localtime(last)) if last else self.t["never"]
+        kind = st.get("last_upload_kind")
+        if last and kind in ("full", "prices"):
+            when += f' ({self.t["kind_" + kind]})'
         return self.t["last"].format(when)
 
     def count_text(self, item=None):

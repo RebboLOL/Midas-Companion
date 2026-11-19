@@ -48,6 +48,18 @@
         </table>
       </div>
       <p class="muted empty" id="markets-empty" hidden></p>
+      <div class="addm" id="addm">
+        <p class="muted" id="addm-t"></p>
+        <div class="row">
+          <select id="addm-flavor" aria-labelledby="addm-t"></select>
+          <select id="addm-region" aria-labelledby="addm-t"></select>
+          <input type="text" id="addm-realm" spellcheck="false" autocomplete="off" maxlength="100">
+          <select id="addm-faction" aria-labelledby="addm-t"></select>
+          <button type="button" class="btn sm" id="b-addm"></button>
+        </div>
+        <p class="msg" id="addm-msg" role="status"></p>
+        <ul class="manual" id="manual"></ul>
+      </div>
     </section>
 
     <section class="card orn panel" aria-labelledby="h-actions">

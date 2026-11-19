@@ -97,7 +97,7 @@ def test_state_wrong_types_repaired(own_appdata):
     st = U.load_state()
     assert isinstance(st["client_id"], str) and len(st["client_id"]) == 32
     assert st["sent"] == {} and st["names_sent"] == {}
-    assert st["stats"] == {"uploads": 0, "last": 0}
+    assert st["stats"] == {"uploads": 0, "last": 0, "last_full": 0, "last_prices": 0}
     (d / "state.json").write_text(json.dumps([1, 2]), encoding="utf-8")   # not an object
     U.load_state()
     assert len(list(d.glob("state_corrupt_*.json"))) == 1

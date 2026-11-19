@@ -109,6 +109,7 @@ class ExportServer:
         self.drip_headers = False
         self.fail_headers = {}
         self.reject_days = False
+        self.market_list = None   # GET /api/v1/markets: list (JSON) or raw bytes; None = 404
         self.requests = []
         srv = self
 
@@ -125,8 +126,11 @@ class ExportServer:
                     return self.reply(422, b'{"detail":"days"}')
                 if srv.fail:
                     return self.reply(srv.fail, b'{"detail":"x"}', srv.fail_headers)
+                if u.path == "/api/v1/markets" and srv.market_list is not None:      # 1.3.1
+                    ml = srv.market_list
+                    return self.reply(200, ml if isinstance(ml, bytes) else json.dumps(ml).encode())
                 if q.get("realm") in srv.codes:
-                    return self.reply(srv.codes[q["realm"]], b'{"detail":"x"}')
+                    return self.reply(srv.codes[q.get("realm")], b'{"detail":"x"}')
                 if srv.drip:
                     return self.drip_reply()
                 if u.path != "/api/v1/export":
@@ -371,8 +375,10 @@ def test_304_uses_cache_and_merges(tmp_path, xs):
     st = U.load_state()
     run([root], xs.url, st)
     make_game(root, seen=[a, b])                      # second market appears; A answers 304
-    run([root], xs.url, st, now=NOW + 100)
-    assert [r["inm"] is not None for r in xs.requests] == [False, True, False]
+    run([root], xs.url, st, now=NOW + 100)            # A asked < 29 min ago: from the cache
+    assert [r["inm"] is not None for r in xs.requests] == [False, False]
+    run([root], xs.url, st, now=NOW + U.PRICE_FRESH + 200)
+    assert [r["inm"] is not None for r in xs.requests] == [False, False, True, True]
     assert [g["market"] for g in lua_markets(lua_load(addon / "Prices.lua"))] == \
         ["forever/EU/pve/alliance", "forever/EU/pve/horde"]
 
@@ -557,7 +563,9 @@ def test_watcher_checks_after_pass_and_every_30_min(tmp_path, xs, monkeypatch):
     make_game(root, seen=[r])
     xs.markets[U.raw_key(r)] = export("forever/EU/pve/alliance")
     clock = {"t": 1000.0}
+    wall0 = time.time()
     monkeypatch.setattr(U.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(U.time, "time", lambda: wall0 + clock["t"] - 1000.0)
     w = U.Watcher([root], U.Sender(xs.url), logger()[1], interval=30)
     assert w.prices_every == 30 * 60
     w.step()                                           # start: upload pass + prices
@@ -569,16 +577,16 @@ def test_watcher_checks_after_pass_and_every_30_min(tmp_path, xs, monkeypatch):
     w.step()                                           # 30 min later
     assert len(xs.requests) == 2
     clock["t"] += 120
-    w.step(force=True)                                 # after an upload pass
-    assert len(xs.requests) == 3
+    w.step(force=True)                                 # after an upload pass: checked, but the
+    assert len(xs.requests) == 2 and w.prices_ran == clock["t"]   # data is < 29 min old (1.3.1)
     w.set_prices(False)
     assert w.prices_on() is False
     clock["t"] += 3600
     w.step(force=True)
-    assert len(xs.requests) == 3 and U.load_state()["prices_enabled"] is False
+    assert len(xs.requests) == 2 and U.load_state()["prices_enabled"] is False
     w.set_prices(True)
     w.step()
-    assert len(xs.requests) == 4
+    assert len(xs.requests) == 3
 
 
 def test_watcher_outbox_never_fetches(tmp_path, xs):

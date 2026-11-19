@@ -13,12 +13,13 @@
       midasOk: "Midas 1.3.0 oder neuer gefunden", midasNo: "Midas 1.3.0 oder neuer fehlt",
       midasNoD: "Midas über CurseForge installieren oder aktualisieren.",
       midasV: "Midas {v}", midasOld: "Midas {v} – bitte auf 1.3.0 aktualisieren", midasNone: "Midas nicht installiert",
-      oldUplink: "Der Ordner Midas_Uplink wird nicht mehr gebraucht und kann gelöscht werden.",
       shareOk: "Teilen im Spiel an", shareNo: "Teilen im Spiel aus",
       shareNoD: "Im Spiel {c} eingeben oder in Midas unter DATALINK „Share my scans“ einschalten. Die App sieht die Einstellung nach dem nächsten /reload oder Logout.",
       upOk: "Letzter Upload: {t}", upNo: "Noch kein Upload",
-      upNoD: "Nach einem vollständigen Midas-Scan und /reload sendet die App automatisch.",
+      upNoD: "Nach einem Midas-Scan und /reload sendet die App automatisch.",
       upCount: "{n} Scans gesendet",
+      kindFull: "voller Scan", kindPrices: "Preis-Scan",
+      upLastFull: "Letzter voller Scan: {t}", upLastPrices: "Letzter Preis-Scan: {t}",
       prOk: "Server-Preise geschrieben", prOkD: "Im Spiel /reload, damit Midas die Preise lädt.",
       prEmpty: "Preisdatei geschrieben, noch ohne Preise",
       prEmptyD: "Preise kommen, sobald für deinen Markt Scans vorliegen. Danach im Spiel /reload.",
@@ -27,9 +28,20 @@
       prLast: "Letzte Abfrage: {t}",
       folderT: "Ordnerpfad eingeben oder auswählen:", folderSet: "Übernehmen", folderPick: "Ordner wählen …",
       folderBad: "In diesem Ordner wurde kein World of Warcraft gefunden.", folderOk: "Übernommen: {p}",
-      markets: "Märkte", marketsSub: "im Spiel gesehen, letzte 30 Tage",
+      markets: "Märkte", marketsSub: "aus Midas, dem Spielordner oder der Serverliste",
+      srcSeen: "aus Midas", srcWtf: "aus Spielordner erkannt", srcManual: "von Hand hinzugefügt",
+      srcList: "aus Serverliste (Forever)",
+      fList: "{f}: {n} Märkte aus der Serverliste (Region {r})",
+      fWtf: "{f}: {n} Realms aus dem Spielordner erkannt (Region {r}), beide Fraktionen",
+      fNoRegion: "{f}: Region im Spielordner unbekannt (WTF\\Config.wtf) – Markt unten von Hand hinzufügen.",
+      fNumbered: "{f}: Die Serverliste hat für Region {r} noch keinen Markt – Markt unten von Hand hinzufügen.",
+      addT: "Markt fehlt? Spielversion, Region, Realm (Name genau wie im Spiel) und Fraktion wählen:",
+      addB: "Markt hinzufügen", addRealm: "Realm-Name", addOk: "Hinzugefügt. Die App fragt die Server-Preise gleich ab.",
+      addErr: { realm: "Realm-Name fehlt oder ist ungültig.", dup: "Dieser Markt ist schon eingetragen.",
+                full: "Höchstens {n} Märkte von Hand.", other: "Eingabe prüfen." },
+      facA: "Allianz", facH: "Horde", facB: "Beide Fraktionen", del: "Entfernen",
       thM: "Markt", thSeen: "Im Spiel", thUp: "Letzter Upload", thSrv: "Server-Preise",
-      marketsEmpty: "Noch keine Märkte. Einmal im Spiel einloggen und /reload – dann erscheinen sie hier.",
+      marketsEmpty: "Noch keine Märkte. Einmal im Spiel einloggen – oder unten einen Markt hinzufügen.",
       items: "{n} Items", none: "–",
       actions: "Aktionen", swPrices: "Server-Preise laden", swAuto: "Autostart beim Windows-Start",
       bLog: "Log öffnen", bData: "Datenordner öffnen", bPick: "WoW-Ordner wählen",
@@ -50,12 +62,13 @@
       midasOk: "Midas 1.3.0 or newer found", midasNo: "Midas 1.3.0 or newer missing",
       midasNoD: "Install or update Midas from CurseForge.",
       midasV: "Midas {v}", midasOld: "Midas {v} – please update to 1.3.0", midasNone: "Midas not installed",
-      oldUplink: "The Midas_Uplink folder is no longer needed and can be deleted.",
       shareOk: "Sharing is on in the game", shareNo: "Sharing is off in the game",
       shareNoD: "Type {c} in the game or turn on “Share my scans” under DATALINK in Midas. The app sees the setting after the next /reload or logout.",
       upOk: "Last upload: {t}", upNo: "No upload yet",
-      upNoD: "After a full Midas scan and /reload the app sends it automatically.",
+      upNoD: "After a Midas scan and /reload the app sends it automatically.",
       upCount: "{n} scans sent",
+      kindFull: "full scan", kindPrices: "price scan",
+      upLastFull: "Last full scan: {t}", upLastPrices: "Last price scan: {t}",
       prOk: "Server prices written", prOkD: "Type /reload in the game so Midas loads them.",
       prEmpty: "Price file written, no prices yet",
       prEmptyD: "Prices arrive as soon as there are scans for your market. Then /reload in the game.",
@@ -64,9 +77,20 @@
       prLast: "Last check: {t}",
       folderT: "Enter or choose the folder:", folderSet: "Apply", folderPick: "Choose folder …",
       folderBad: "No World of Warcraft found in this folder.", folderOk: "Added: {p}",
-      markets: "Markets", marketsSub: "seen in the game, last 30 days",
+      markets: "Markets", marketsSub: "from Midas, the game folder or the server list",
+      srcSeen: "from Midas", srcWtf: "found in the game folder", srcManual: "added by hand",
+      srcList: "from server list (Forever)",
+      fList: "{f}: {n} markets from the server list (region {r})",
+      fWtf: "{f}: {n} realms found in the game folder (region {r}), both factions",
+      fNoRegion: "{f}: region unknown in the game folder (WTF\\Config.wtf) – add the market by hand below.",
+      fNumbered: "{f}: the server list has no market for region {r} yet – add the market by hand below.",
+      addT: "Market missing? Choose game version, region, realm (name exactly as in the game) and faction:",
+      addB: "Add market", addRealm: "Realm name", addOk: "Added. The app asks for the server prices right away.",
+      addErr: { realm: "Realm name missing or not valid.", dup: "This market is already listed.",
+                full: "At most {n} markets by hand.", other: "Please check the input." },
+      facA: "Alliance", facH: "Horde", facB: "Both factions", del: "Remove",
       thM: "Market", thSeen: "In game", thUp: "Last upload", thSrv: "Server prices",
-      marketsEmpty: "No markets yet. Log in once in the game and /reload – they show up here.",
+      marketsEmpty: "No markets yet. Log in once in the game – or add a market below.",
       items: "{n} items", none: "–",
       actions: "Actions", swPrices: "Load server prices", swAuto: "Start with Windows",
       bLog: "Open log", bData: "Open data folder", bPick: "Choose WoW folder",
@@ -131,6 +155,15 @@
     $("th-m").textContent = T.thM; $("th-seen").textContent = T.thSeen;
     $("th-up").textContent = T.thUp; $("th-srv").textContent = T.thSrv;
     $("markets-empty").textContent = T.marketsEmpty;
+    $("addm-t").textContent = T.addT; $("b-addm").textContent = T.addB;
+    $("addm-realm").placeholder = T.addRealm;
+    function opts(id, list) {
+      var s = $(id);
+      list.forEach(function (o) { var e = el("option", null, o[1]); e.value = o[0]; s.appendChild(e); });
+    }
+    opts("addm-flavor", [["_classic_era_", "Classic Era"], ["_anniversary_", "Anniversary"], ["_forever_", "Forever"]]);
+    opts("addm-region", [["EU", "EU"], ["US", "US"], ["KR", "KR"], ["TW", "TW"], ["CN", "CN"]]);
+    opts("addm-faction", [["Both", T.facB], ["Alliance", T.facA], ["Horde", T.facH]]);
     $("h-actions").textContent = T.actions;
     $("sw-prices-t").textContent = T.swPrices;
     $("sw-auto-t").textContent = T.swAuto;
@@ -173,30 +206,52 @@
     else open += check(ol, "bad", T.wowNo, [T.wowNoD]);
     $("folder").hidden = s.wow.found || s.only_wow;
     // 2. Midas >= 1.3.0 per game version
-    var fl = s.flavors.filter(function (f) { return f.midas || f.old_uplink; });
+    var fl = s.flavors.filter(function (f) { return f.midas; });
     var lines = fl.map(function (f) {
       var t = !f.midas ? T.midasNone : f.midas_ok ? fmt(T.midasV, { v: f.midas }) : fmt(T.midasOld, { v: f.midas });
       return el("div", f.midas_ok ? "sub" : null, f.label + ": " + t);
     });
-    if (s.midas_ok && fl.some(function (f) { return f.old_uplink && f.midas_ok; })) lines.push(el("div", "sub", T.oldUplink));
     if (!s.midas_ok) lines.push(T.midasNoD);
     if (s.wow.found) open += check(ol, s.midas_ok ? "ok" : "todo", s.midas_ok ? T.midasOk : T.midasNo, lines);
     // 3. sharing
     open += check(ol, s.share_on ? "ok" : "todo", s.share_on ? T.shareOk : T.shareNo,
       s.share_on ? [] : [withCode(T.shareNoD, "/midas datalink on")]);
     // 4. last upload
-    if (s.last_upload) check(ol, "ok", fmt(T.upOk, { t: when(s.last_upload) }), [fmt(T.upCount, { n: s.uploads })]);
+    if (s.last_upload) {
+      var kind = s.last_kind === "prices" ? T.kindPrices : s.last_kind === "full" ? T.kindFull : null;
+      var upLines = [fmt(T.upCount, { n: s.uploads })];
+      // the other kind, when there was one: "last full scan ..." under a price scan and vice versa
+      if (s.last_kind === "prices" && s.last_full) upLines.push(fmt(T.upLastFull, { t: when(s.last_full) }));
+      if (s.last_kind === "full" && s.last_prices) upLines.push(fmt(T.upLastPrices, { t: when(s.last_prices) }));
+      check(ol, "ok", fmt(T.upOk, { t: when(s.last_upload) + (kind ? " (" + kind + ")" : "") }), upLines);
+    }
     else open += check(ol, "todo", T.upNo, [T.upNoD]);
     // 5. server prices
     var pl = s.prices_last ? fmt(T.prLast, { t: when(s.prices_last) }) : null;
     if (!s.prices_enabled) check(ol, "off", T.prOff, [T.prOffD]);
     else if (s.prices_written && s.prices_with_data) check(ol, "ok", T.prOk, [withCode(T.prOkD.replace("/reload", "{c}"), "/reload"), pl]);
-    else if (s.prices_written) open += check(ol, "todo", T.prEmpty, [T.prEmptyD, pl]);
-    else open += check(ol, "todo", T.prNo, [T.prNoD, pl]);
+    else if (s.prices_written) open += check(ol, "todo", T.prEmpty, [T.prEmptyD, pl].concat(foundLines(s)));
+    else open += check(ol, "todo", T.prNo, [T.prNoD, pl].concat(foundLines(s)));
     $("setup-sub").textContent = open ? fmt(T.setupTodo, { n: open }) : T.setupOk;
   }
 
+  // markets taken from the game folder (before the first logout with Midas)
+  function foundLines(s) {
+    var out = [];
+    s.flavors.forEach(function (f) {
+      var n = f.found;
+      if (!n) return;
+      var has = s.markets.some(function (m) { return m.flavor === f.flavor; });
+      if (n.realms) out.push(el("div", "sub", fmt(T.fWtf, { f: f.label, n: n.realms, r: n.region })));
+      if (n.listed) out.push(el("div", "sub", fmt(T.fList, { f: f.label, n: n.listed, r: n.region })));
+      else if (n.no_region && !has) out.push(el("div", null, fmt(T.fNoRegion, { f: f.label })));
+      else if (n.numbered && !n.realms && !has) out.push(el("div", null, fmt(T.fNumbered, { f: f.label, r: n.region })));
+    });
+    return out;
+  }
+
   // ---- markets -----------------------------------------------------------------
+  var manualSig = null;
   function renderMarkets(s) {
     var tb = $("markets").tBodies[0];
     tb.textContent = "";
@@ -205,15 +260,19 @@
     s.markets.forEach(function (m) {
       var tr = el("tr");
       var c1 = el("td");
-      c1.appendChild(el("div", "mk", m.realm));
+      c1.appendChild(el("div", "mk", m.realm || (CLIENT[m.client] || m.client) + " " + (m.ruleset || "")));
       var sub = el("div", "s");
       sub.appendChild(document.createTextNode((CLIENT[m.client] || m.client) + " · " + m.region +
         (m.ruleset ? " · " + m.ruleset : "") + " · "));
       sub.appendChild(el("span", "fa-" + String(m.faction).toLowerCase(), m.faction));
       c1.appendChild(sub);
+      c1.appendChild(el("div", "src", m.src === "wtf" ? T.srcWtf : m.src === "manual" ? T.srcManual : m.src === "list" ? T.srcList : T.srcSeen));
       tr.appendChild(c1);
-      tr.appendChild(el("td", null, when(m.last_seen)));
-      tr.appendChild(el("td", null, when(m.upload_at)));
+      tr.appendChild(el("td", null, when(m.src === "wtf" ? m.folder_at : m.last_seen)));
+      var cu = el("td");
+      cu.appendChild(el("div", null, when(m.upload_at)));
+      if (m.upload_at && m.upload_kind) cu.appendChild(el("div", "s", m.upload_kind === "prices" ? T.kindPrices : T.kindFull));
+      tr.appendChild(cu);
       var c4 = el("td");
       if (m.server_ts) {
         c4.appendChild(el("div", null, when(m.server_ts)));
@@ -221,6 +280,22 @@
       } else c4.textContent = T.none;
       tr.appendChild(c4);
       tb.appendChild(tr);
+    });
+    $("b-addm").disabled = (s.manual || []).length >= (s.manual_max || 10);
+    var sig = JSON.stringify(s.manual || []);
+    if (sig === manualSig) return;                // keep the buttons while nothing changed
+    manualSig = sig;
+    var ul = $("manual");
+    ul.textContent = "";
+    (s.manual || []).forEach(function (m) {
+      var li = el("li");
+      li.appendChild(el("span", null, m.label + " · " + m.region + " · " + m.realm + " · " +
+        (m.faction === "Both" ? T.facB : m.faction === "Horde" ? T.facH : T.facA)));
+      var b = el("button", "btn sm", T.del);
+      b.type = "button";
+      b.addEventListener("click", function () { api("api/market_del", { id: m.id }).then(poll); });
+      li.appendChild(b);
+      ul.appendChild(li);
     });
   }
 
@@ -315,6 +390,20 @@
   $("b-folder-set").addEventListener("click", function () {
     api("api/folder", { path: $("folder-in").value.trim() }).then(folderMsg);
   });
+  $("b-addm").addEventListener("click", function () {
+    var msg = $("addm-msg");
+    api("api/market_add", { flavor: $("addm-flavor").value, region: $("addm-region").value,
+                            realm: $("addm-realm").value.trim(), faction: $("addm-faction").value })
+      .then(function (r) {
+        if (r.ok) { msg.className = "msg"; msg.textContent = T.addOk; $("addm-realm").value = ""; }
+        else {
+          msg.className = "msg err";
+          msg.textContent = fmt(T.addErr[r.error] || T.addErr.other, { n: lastStatus ? lastStatus.manual_max : 10 });
+        }
+        poll();
+      });
+  });
+  $("addm-realm").addEventListener("keydown", function (e) { if (e.key === "Enter") $("b-addm").click(); });
   $("folder-in").addEventListener("keydown", function (e) { if (e.key === "Enter") $("b-folder-set").click(); });
 
   texts();

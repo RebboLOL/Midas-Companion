@@ -24,6 +24,12 @@ backoff as snapshots) and remembers it in the state (history_sent).
 so a fresh install gets the full price history after the first sync. A server
 without days=90 answers 422; the tool then asks once more without days (14).
 
+Price scans (1.3.1, Datalink addendum 3): Midas also queues scans without an
+offer book (MidasUplinkDB.pqueue, items "listed,low"). They are posted to the same
+URL with "kind": "prices" after the full snapshots of a pass, with their own
+backoff: a server without price scans (422) or one that does not confirm the kind
+in its answer pauses only the price scans, never the full snapshots.
+
 Datalink 1.3.0 (Midas Companion): Midas 1.3.0 keeps MidasUplinkDB in its own
 SavedVariables file Midas.lua (next to MidasDB, up to ~50 MB). Only the
 MidasUplinkDB block is cut out and parsed; the old Midas_Uplink.lua is still read.
@@ -31,6 +37,29 @@ Prices.lua goes to AddOns\\Midas (when Midas.toc lists Prices.lua) and to
 AddOns\\Midas_Uplink as long as that folder exists. The file carries app = <version>
 and checked = <last successful server query> and is written even without prices
 (markets = {}), so the addon can tell that the app is installed.
+
+Markets before the first logout (1.3.1): MidasUplinkDB.seen only exists once WoW
+wrote the SavedVariables. Until then the markets are taken from the game folder:
+WTF\\Account\\<acc>\\<realm>\\<character> (WoW creates it for every realm played)
+plus the region from WTF\\Config.wtf (SET portal "eu"), both factions asked.
+Classic Era/Anniversary realm folders carry the realm name as GetRealmName()
+shows it; Forever uses numbered realm folders, which cannot be turned into a
+market (window: add the market by hand). Seen markets always come first; markets
+added by hand in the window are kept in the state (max. 10).
+
+Forever before the first logout (1.3.1, Datalink addendum 2 of 18.11.2026): the
+Forever realm folders only carry numbers. With a known region and a realm folder of
+the last 30 days, but no seen Forever market, the tool reads the market list
+(GET .../api/v1/markets, at most every 6 h), takes the Forever markets of the region
+(max. 4, newest first) and fetches them without a realm name; they are written with
+match = {} and the server's market key, which Midas 1.3.0 uses for Forever.
+
+Item data from the game (1.3.1, Datalink addendum 18.11.2026): MidasUplinkDB.meta
+[itemID] = "icon:class:sub:bind:ilvl:req:slot:stack:sell" (metaV = 1) rides with the
+snapshot upload as meta = {"<id>": "<value>"}: only items of that snapshot, only
+valid strings, once per URL and game client (state meta_sent, marked only after a 2xx whose JSON
+answer carries meta = <number taken> > 0 and not quarantined; older servers
+ignore the field).
 
 Usage:
   python uploader.py --once                one pass, then exit
@@ -56,6 +85,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,7 +93,7 @@ import uuid
 import zlib
 from pathlib import Path
 
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 APP_NAME = "Midas Companion"
 DEFAULT_URL = "https://midasmarket.app/api/v1/snapshots"
 LOCAL_URL = "http://127.0.0.1:8000/api/v1/snapshots"     # 0.1.0/0.2.0 default
@@ -85,6 +115,22 @@ HISTORY_UNSUPPORTED = (404, 405)         # server without /history: try again la
 HISTORY_RETRY_UNSUPPORTED = 6 * 3600
 HISTORY_KEEP = 100                       # remembered history block keys per target
 _HIST_ROWS_RE = re.compile(r"[0-9]+:[0-9]+:[0-9]+(;[0-9]+:[0-9]+:[0-9]+)*", re.ASCII)
+
+# Price scans (1.3.1, Datalink addendum 3 of 19.11.2026): MidasUplinkDB.pqueue holds scans
+# without an offer book ({kind = "prices", items = {[id] = "listed,low"}}); they are posted
+# with "kind": "prices" after the full snapshots of the same pass.
+PRICE_KIND = "prices"
+PQ_MAX_ITEMS = 60_000                    # server: at most 60,000 items per snapshot
+PQ_NUM_MAX = 2 ** 53 - 1                 # server: MAX_NUMBER
+_PQ_ITEM_RE = re.compile(r"([0-9]{1,16}),([0-9]{1,16})", re.ASCII)
+PQ_UNSUPPORTED_WAIT = 3600               # 422 (server without price scans): next try in 1 h
+PQ_UNCONFIRMED_WAIT = 6 * 3600           # 2xx without "kind": "prices" (older server): pause
+PQ_GIVE_UP = 3                           # a price scan refused this often with 422 is dropped
+PQ_TRIES_KEEP = 50
+PQ_CAPS_EVERY = 6 * 3600                 # GET /health (snapshot_kinds) asked again after
+PQ_CAPS_KEEP = 10                        # targets remembered
+PQ_HEALTH_MAX = 64 * 1024                # answer of /health
+PQ_PER_HOUR = 6                          # price scans per target and hour (server: 12/h with the full ones)
 
 _log = logging.getLogger("midasuplink")
 
@@ -520,6 +566,50 @@ def snap_key(s):
     return f'{mk["client"]}|{mk["region"]}|{mk["realm"]}|{mk["faction"]}|{s["ts"]}'
 
 
+def valid_price_snapshot(s):
+    """Price scan of MidasUplinkDB.pqueue -> cleaned dict or None.
+    {v = 1, kind = "prices", seq, ts, addon, market = {...}, count, items = {[id] = "listed,low"}}:
+    listed >= 0, low > 0 (copper); items with a malformed key or value are left out,
+    a scan without a valid item or with more than PQ_MAX_ITEMS items is not sent."""
+    if not isinstance(s, dict) or s.get("v") != 1 or s.get("kind") != PRICE_KIND:
+        return None
+    mk = s.get("market")
+    if not isinstance(mk, dict) or any(not isinstance(mk.get(k), str) or not mk.get(k)
+                                       for k in REQUIRED_MARKET):
+        return None
+    if type(s.get("ts")) is not int or s["ts"] < 0 or not isinstance(s.get("items"), (dict, list)):
+        return None
+    raw = as_map(s["items"])
+    if len(raw) > PQ_MAX_ITEMS:
+        return None
+    items = {}
+    for k, v in raw.items():
+        if type(k) is not int or not 0 < k <= ITEM_ID_MAX or not isinstance(v, str):
+            continue
+        m = _PQ_ITEM_RE.fullmatch(v)
+        if m is None:
+            continue
+        listed, low = int(m.group(1)), int(m.group(2))
+        if low < 1 or listed > PQ_NUM_MAX or low > PQ_NUM_MAX:
+            continue
+        items[k] = f"{listed},{low}"
+    if not items:
+        return None
+    out = {"v": 1, "kind": PRICE_KIND, "ts": s["ts"],
+           "addon": s.get("addon") if isinstance(s.get("addon"), str) else None,
+           "market": {k: mk.get(k) for k in ("client", "region", "realm", "faction", "ruleset")
+                      if isinstance(mk.get(k), str)},
+           "items": items}
+    if type(s.get("seq")) is int:
+        out["seq"] = s["seq"]
+    return out
+
+
+def price_key(s):
+    """State key of a price scan in `sent` (never equal to a full snapshot's key)."""
+    return PRICE_KIND + "|" + snap_key(s)
+
+
 def valid_history(b):
     """Prepared price-history block (addon 0.4.0) -> cleaned dict or None.
     Items with a malformed key or value are left out."""
@@ -557,20 +647,28 @@ def history_payload(b, client_id):
 
 
 def read_sv(path):
-    """-> {"queue": [...], "history": [...], "names": {id: str}, "quality": {id: int},
-    "locale": str|None}. Empty queue and history when sharing is off (opt-in respected
-    even if a queue is left)."""
+    """-> {"queue": [...], "pqueue": [...], "history": [...], "names": {id: str},
+    "quality": {id: int}, "locale": str|None, "meta": {id: str}}. Empty queues and history
+    when sharing is off (opt-in respected even if a queue is left); names and meta are read
+    only then, too. pqueue (1.3.1, 19.11.) = price scans without an offer book."""
     data = load_uplink_db(path) or {}
-    out = {"queue": [], "history": [], "names": {}, "quality": {}, "locale": None}
+    out = {"queue": [], "pqueue": [], "history": [], "names": {}, "quality": {}, "locale": None,
+           "meta": {}}
     if not isinstance(data, dict) or data.get("enabled") is not True:
         return out
     out["queue"] = [s for s in (data.get("queue") or []) if valid_snapshot(s)]
+    pq = data.get("pqueue")
+    if isinstance(pq, (list, dict)):
+        out["pqueue"] = sorted((p for p in (valid_price_snapshot(v) for v in as_map(pq).values())
+                                if p is not None), key=lambda p: (p["ts"], p.get("seq", 0)))
     hist = data.get("history")
     if isinstance(hist, dict):
         out["history"] = [b for b in (valid_history(v) for _k, v in sorted(hist.items(), key=lambda kv: str(kv[0])))
                           if b is not None]
     out["names"] = as_map(data.get("names"))
     out["quality"] = as_map(data.get("quality"))
+    if data.get("metaV") == META_V and type(data.get("metaV")) is int:
+        out["meta"] = as_map(data.get("meta"))
     loc = data.get("locale")
     out["locale"] = loc if isinstance(loc, str) and loc else None
     return out
@@ -612,7 +710,76 @@ def names_for(s, sv, already):
     return {"locale": loc, "items": items} if items else None
 
 
-def payload(s, client_id, names=None):
+META_V = 1                               # layout of MidasUplinkDB.meta (Datalink addendum 18.11.2026)
+META_MAX = 20_000                        # entries per upload; the rest rides with the next snapshot
+# "icon:class:sub:bind:ilvl:req:slot:stack:sell": 9 fields, numbers >= 0, slot = equipLoc or empty
+_META_RE = re.compile(r"(?:[0-9]{1,10}:){6}[A-Z0-9_]{0,30}:[0-9]{1,10}:[0-9]{1,10}", re.ASCII)
+
+
+META_NUM_MAX = 2_147_483_647             # server: numbers 0 ... 2^31-1
+
+
+def valid_meta(v):
+    if not isinstance(v, str) or _META_RE.fullmatch(v) is None:
+        return False
+    f = v.split(":")
+    return all(int(f[i]) <= META_NUM_MAX for i in (0, 1, 2, 3, 4, 5, 7, 8))
+
+
+def meta_for(s, sv, already):
+    """Item data block for snapshot s: {"<id>": "<meta string>"} only for items of s
+    with a valid meta string that are not yet in `already` (set of int ids).
+    None when nothing is new. Language independent (one list per URL)."""
+    meta = sv.get("meta") or {}
+    if not meta:
+        return None
+    out = {}
+    for k in s["items"]:
+        try:
+            iid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if iid in already or not 0 < iid <= ITEM_ID_MAX:
+            continue
+        v = meta.get(iid)
+        if valid_meta(v):
+            out[str(iid)] = v
+            if len(out) >= META_MAX:
+                break
+    return out or None
+
+
+META_CLIENTS = ("forever", "era")        # the server keeps item data per game client (flavor)
+
+
+def meta_key(target, client):
+    """State key of meta_sent: the same item id differs between Forever and Era, so
+    the list is kept per target and client. None for an unknown client (no item data)."""
+    return f"{target}|{client}" if client in META_CLIENTS else None
+
+
+def meta_taken(sender):
+    """Number of item data entries the server says it stored (answer field meta), or None."""
+    reply = getattr(sender, "last_reply", None)
+    n = reply.get("meta") if isinstance(reply, dict) else None
+    return n if type(n) is int and n >= 0 else None
+
+
+def meta_acknowledged(sender):
+    """True when the 2xx answer says the server stored item data of this upload:
+    {"meta": <int > 0>} and not "quarantined": true. Without the field (server
+    before the item-data release), with meta = 0 (nothing taken, quarantine, parallel
+    duplicate) nothing is marked - the entries ride along again with the next snapshot."""
+    reply = getattr(sender, "last_reply", None)
+    if not isinstance(reply, dict) or reply.get("quarantined") is True:
+        return False
+    n = reply.get("meta")
+    return type(n) is int and n > 0
+
+
+def payload(s, client_id, names=None, meta=None):
+    """Upload body. A price scan (s["kind"] == "prices") carries "kind": "prices" on the
+    top level and in the snapshot; full snapshots stay exactly as before."""
     body = {
         "format": 1,
         "uploader": VERSION,
@@ -625,8 +792,13 @@ def payload(s, client_id, names=None):
             "items": {str(k): v for k, v in s["items"].items() if isinstance(v, str)},
         },
     }
+    if s.get("kind") == PRICE_KIND:
+        body["kind"] = PRICE_KIND
+        body["snapshot"]["kind"] = PRICE_KIND
     if names:
         body["names"] = names
+    if meta:
+        body["meta"] = meta
     return body
 
 
@@ -715,10 +887,43 @@ def load_state():
     ns = st.get("names_sent")
     st["names_sent"] = ({k: v for k, v in ns.items() if isinstance(k, str) and isinstance(v, str)}
                         if isinstance(ns, dict) else {})
+    ms = st.get("meta_sent")       # 1.3.1: item data sent per target AND game client (id ranges);
+    st["meta_sent"] = ({k: v for k, v in ms.items()   # keys without a client (first layout) are dropped
+                        if isinstance(k, str) and isinstance(v, str)
+                        and k.rpartition("|")[2] in META_CLIENTS and k.rpartition("|")[0]}
+                       if isinstance(ms, dict) else {})
     stats = st.get("stats")
     stats = stats if isinstance(stats, dict) else {}
     st["stats"] = {k: (stats.get(k) if isinstance(stats.get(k), int) and not isinstance(stats.get(k), bool)
-                       else 0) for k in ("uploads", "last")}
+                       else 0) for k in ("uploads", "last", "last_full", "last_prices")}
+    # 1.3.1 (19.11.): full scans and price scans are told apart in the window and the tray
+    lk = st.get("last_upload_kind")
+    if lk not in ("full", "prices"):
+        lk = None
+        if st["stats"]["last"] and not st["stats"]["last_full"] and not st["stats"]["last_prices"]:
+            st["stats"]["last_full"] = st["stats"]["last"]      # before price scans every upload was full
+            lk = "full"
+    st["last_upload_kind"] = lk
+    for k in ("pqueue_not_before", "pqueue_backoff"):
+        v = st.get(k)
+        st[k] = v if type(v) is int and v >= 0 else 0
+    st["pqueue_backoff"] = min(st["pqueue_backoff"], MAX_BACKOFF)
+    if st["pqueue_not_before"] > int(time.time()) + PQ_UNCONFIRMED_WAIT:   # clock was set back
+        st["pqueue_not_before"] = 0
+    tg = st.get("pqueue_target")
+    st["pqueue_target"] = tg if isinstance(tg, str) else None
+    pc = st.get("pqueue_caps")
+    st["pqueue_caps"] = ({k: {"at": v["at"], "ok": v["ok"]} for k, v in list(pc.items())[-PQ_CAPS_KEEP:]
+                          if isinstance(k, str) and isinstance(v, dict) and type(v.get("at")) is int
+                          and v["at"] >= 0 and isinstance(v.get("ok"), bool)}
+                         if isinstance(pc, dict) else {})
+    sa = st.get("pqueue_sent_at")
+    st["pqueue_sent_at"] = ([t for t in sa if type(t) is int and t >= 0][-PQ_PER_HOUR:]
+                            if isinstance(sa, list) else [])
+    pt = st.get("pqueue_tries")
+    st["pqueue_tries"] = ({k: v for k, v in list(pt.items())[-PQ_TRIES_KEEP:]
+                           if isinstance(k, str) and type(v) is int and 0 < v < PQ_GIVE_UP}
+                          if isinstance(pt, dict) else {})
     pe = st.get("prices_enabled")
     st["prices_enabled"] = pe if isinstance(pe, bool) else True
     tags = st.get("prices_etag")
@@ -743,7 +948,9 @@ def load_state():
     st["prices_last"] = pl if isinstance(pl, int) and not isinstance(pl, bool) and pl >= 0 else 0
     # 1.3.0: window / status
     um = st.get("upload_markets")
-    st["upload_markets"] = ({k: {"ts": v["ts"], "at": v["at"]} for k, v in um.items()
+    st["upload_markets"] = ({k: {"ts": v["ts"], "at": v["at"],
+                                 "kind": v["kind"] if v.get("kind") in ("full", "prices") else "full"}
+                             for k, v in um.items()
                              if isinstance(k, str) and isinstance(v, dict)
                              and type(v.get("ts")) is int and type(v.get("at")) is int}
                             if isinstance(um, dict) else {})
@@ -755,6 +962,27 @@ def load_state():
     wd = st.get("wow_dirs")
     st["wow_dirs"] = [d for d in wd if isinstance(d, str) and d][:10] if isinstance(wd, list) else []
     st["window_shown"] = st.get("window_shown") is True
+    # 1.3.1: Forever markets of the server list (cache, asked at most every LIST_EVERY)
+    ml = st.get("markets_list")
+    ml = ml if isinstance(ml, dict) else {}
+    st["markets_list"] = {
+        "base": ml.get("base") if isinstance(ml.get("base"), str) else "",
+        "at": ml.get("at") if type(ml.get("at")) is int and ml.get("at") >= 0 else 0,
+        "tried": ml.get("tried") if type(ml.get("tried")) is int and ml.get("tried") >= 0 else 0,
+        "forever": clean_market_list(ml.get("forever")) or []}
+    # 1.3.1: markets added by hand in the window
+    mm = st.get("manual_markets")
+    clean, keys = [], set()
+    for e in (mm if isinstance(mm, list) else []):
+        try:
+            c = clean_manual_market(e)
+            mid = manual_id(c)
+        except (ValueError, TypeError, KeyError):   # broken entry: dropped, the app goes on
+            continue
+        if mid not in keys and len(clean) < MANUAL_MAX:
+            keys.add(mid)
+            clean.append(c)
+    st["manual_markets"] = clean
     return st
 
 
@@ -860,6 +1088,9 @@ class Sender:
         self.url = url
         self.outbox = Path(outbox) if outbox else None
         self.timeout = timeout
+        self.last_reply = None              # JSON object of the last 2xx answer (or None)
+        self.last_code = None               # HTTP status of the last send (None: outbox/network)
+        self.last_detail = None             # "detail" of the last 4xx JSON answer
 
     @property
     def target(self):
@@ -875,10 +1106,15 @@ class Sender:
             self.outbox.mkdir(parents=True, exist_ok=True)
             s = body["snapshot"]
             mk = s["market"]
-            name = f'{s["ts"]}_{mk["client"]}_{mk["region"]}_{mk["faction"]}.json'
+            pre = "prices_" if body.get("kind") == PRICE_KIND else ""
+            name = f'{pre}{s["ts"]}_{mk["client"]}_{mk["region"]}_{mk["faction"]}.json'
             (self.outbox / name).write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+            self.last_reply = {"meta": len(body["meta"])} if body.get("meta") else None
+            if body.get("kind") == PRICE_KIND:
+                self.last_reply = dict(self.last_reply or {}, kind=PRICE_KIND)
+            self.last_code = None
             return SENT, "outbox " + name
-        result, info, _code = self._post(self.url, body)
+        result, info, self.last_code = self._post(self.url, body)
         return result, info
 
     def send_history(self, body):
@@ -900,11 +1136,16 @@ class Sender:
         req = urllib.request.Request(url, data=raw, method="POST", headers={
             "Content-Type": "application/json", "Content-Encoding": "gzip",
             "User-Agent": f"MidasUplink/{VERSION}"})
+        self.last_reply = None
+        self.last_detail = None
         try:
             with _opener.open(req, timeout=self.timeout) as r:
                 info = f"HTTP {r.status}"
                 try:
-                    st = json.loads(r.read() or b"{}").get("status")
+                    reply = json.loads(r.read() or b"{}")
+                    st = reply.get("status")
+                    if 200 <= r.status < 300:
+                        self.last_reply = reply
                     if st:
                         info += f" {st}"
                 except (ValueError, AttributeError):
@@ -920,6 +1161,11 @@ class Sender:
                 return CONFIG, (f"HTTP {e.code} redirect to {loc or '?'} - upload URL is wrong, "
                                 f"check --url / MIDAS_UPLINK_URL"), e.code
             if e.code in DROP_CODES:                 # invalid: never retry
+                try:
+                    det = json.loads(e.read(16384) or b"{}").get("detail")
+                    self.last_detail = det if isinstance(det, str) else None
+                except (ValueError, AttributeError, OSError, http.client.HTTPException):
+                    pass
                 return DROPPED, f"HTTP {e.code} (dropped)", e.code
             return RETRY, f"HTTP {e.code}", e.code   # 429, 5xx, anything else: later
         except (urllib.error.URLError, OSError) as e:
@@ -930,14 +1176,22 @@ class Sender:
 PASS_OK, PASS_RETRY, PASS_CONFIG = "ok", "retry", "config"
 
 
-def run_pass(roots, sender, st, log):
-    """One pass over all SV files.
+def run_pass(roots, sender, st, log, out=None):
+    """One pass over all SV files: full snapshots (and history) of every file first,
+    then the price scans of every file.
     -> PASS_OK (nothing left), PASS_RETRY (server busy/down or a file could not
-    be read yet), PASS_CONFIG (redirect: wrong URL)."""
+    be read yet), PASS_CONFIG (redirect: wrong URL). Price scans never cause
+    PASS_RETRY (own backoff in the state, see send_price_scans); `out` (dict) gets
+    "prices_wait" = seconds until price scans still waiting should be tried again
+    (None: nothing waiting)."""
     target = sender.target
     sent_l = sent_list(st, target)
     sent = set(sent_l)
     result_all = PASS_OK
+    pending = []                                     # (price scan, sv) not sent yet
+    full_ts = {}                                     # market -> newest full snapshot in the files
+    if out is not None:
+        out["prices_wait"] = None
     for path in sv_sources(roots):
         try:
             sv = read_sv(path)
@@ -946,16 +1200,35 @@ def run_pass(roots, sender, st, log):
             result_all = PASS_RETRY                  # WoW may still be writing it
             continue
         nkey = names_key(target, sv["locale"]) if sv["locale"] else None
+        pending.extend((p, sv) for p in sv["pqueue"] if price_key(p) not in sent)
+        for s in sv["queue"]:
+            m = _market_of(s)
+            full_ts[m] = max(full_ts.get(m, -1), s["ts"])
         for s in sv["queue"]:
             k = snap_key(s)
             if k in sent:
                 continue
             already = decode_ids(st["names_sent"].get(nkey, "")) if nkey else set()
             names = names_for(s, sv, already)
-            result, info = sender.send(payload(s, st["client_id"], names))
+            mkey = meta_key(target, s["market"].get("client"))
+            meta_done = decode_ids(st["meta_sent"].get(mkey, "")) if mkey else set()
+            meta = meta_for(s, sv, meta_done) if mkey else None
+            result, info = sender.send(payload(s, st["client_id"], names, meta))
+            if result == DROPPED and meta:           # refused with item data: once more without
+                meta = None
+                result, info = sender.send(payload(s, st["client_id"], names))
+                info += " (without item data)"
             mk = s["market"]
             extra = f', {len(names["items"])} names' if names else ""
-            log(f'{result} {mk["client"]}/{mk["region"]}/{mk.get("ruleset")}/'
+            if meta:
+                extra += f", {len(meta)} item data"
+                if result == SENT:
+                    took = meta_taken(sender)
+                    extra += ((f" (server took {took})" if took is not None else "")
+                              if meta_acknowledged(sender) else
+                              f" (server took {took}, sent again next time)" if took is not None
+                              else " (not confirmed by the server yet)")
+            log(f'{result} full scan {mk["client"]}/{mk["region"]}/{mk.get("ruleset")}/'
                 f'{mk["faction"]} {time.strftime("%d.%m. %H:%M", time.localtime(s["ts"]))} '
                 f'{len(s["items"])} items{extra} - {info}')
             if result == RETRY:
@@ -970,17 +1243,251 @@ def run_pass(roots, sender, st, log):
                 if names:
                     already.update(int(i) for i in names["items"])
                     st["names_sent"][nkey] = encode_ids(already)
-                st["stats"]["uploads"] = st["stats"].get("uploads", 0) + 1
-                st["stats"]["last"] = int(time.time())
-                um = st.setdefault("upload_markets", {})
-                um["|".join(str(mk[f]) for f in REQUIRED_MARKET)] = {"ts": s["ts"], "at": st["stats"]["last"]}
-                while len(um) > UPLOAD_MARKETS_KEEP:
-                    del um[min(um, key=lambda q: um[q]["at"])]
+                if meta and meta_acknowledged(sender):
+                    meta_done.update(int(i) for i in meta)
+                    st["meta_sent"][mkey] = encode_ids(meta_done)
+                count_upload(st, s, "full")
             save_state(st)
         res = send_history_blocks(sv["history"], sender, st, log)
         if res != PASS_OK:
             return res
-    return result_all
+    res = send_price_scans(pending, sender, st, log, sent_l, sent, out, full_ts=full_ts)
+    return res if res != PASS_OK else result_all
+
+
+def count_upload(st, s, kind):
+    """Statistics + window: last upload (any kind), last full scan, last price scan."""
+    now = int(time.time())
+    stats = st["stats"]
+    stats["uploads"] = stats.get("uploads", 0) + 1
+    stats["last"] = now
+    stats["last_" + kind] = now
+    st["last_upload_kind"] = kind
+    mk = s["market"]
+    um = st.setdefault("upload_markets", {})
+    um["|".join(str(mk[f]) for f in REQUIRED_MARKET)] = {"ts": s["ts"], "at": now, "kind": kind}
+    while len(um) > UPLOAD_MARKETS_KEEP:
+        del um[min(um, key=lambda q: um[q]["at"])]
+
+
+PQ_TS_PAST = 7 * 86400 - 600            # server: snapshots older than 7 days are refused
+PQ_TS_AHEAD = 600                       # server: at most 10 min in the future
+
+
+def price_scan_confirmed(sender):
+    """True when the 2xx answer says the server took the upload as a price scan
+    ("kind": "prices"). A server before price scans ignores the field and would
+    store the scan as a full snapshot - then price scans are paused."""
+    reply = getattr(sender, "last_reply", None)
+    return isinstance(reply, dict) and reply.get("kind") == PRICE_KIND
+
+
+def health_url(upload_url):
+    """.../api/v1/snapshots -> .../api/v1/health (None when it cannot be derived)."""
+    ex = export_url(upload_url)
+    return ex[: -len("export")] + "health" if ex else None
+
+
+def fetch_capabilities(url, timeout=None, deadline=None):
+    """GET /health -> (True | False | None, info): True when snapshot_kinds lists
+    "prices"; False for a server without price scans (field missing, 404/405);
+    None when the question could not be answered (network, 5xx, 429, redirect)."""
+    if not url:
+        return False, "no health URL"
+    timeout = PRICE_TIMEOUT if timeout is None else timeout
+    deadline = PRICE_DEADLINE if deadline is None else deadline
+    end = _clock() + deadline
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                                               "User-Agent": f"MidasUplink/{VERSION}"}, method="GET")
+    _deadline.end = end
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            if r.status != 200:
+                return None, f"HTTP {r.status}"
+            raw = _read_body(r, end, PQ_HEALTH_MAX)
+        obj = json.loads(raw.decode("utf-8"))
+        kinds = obj.get("snapshot_kinds") if isinstance(obj, dict) else None
+        ok = isinstance(kinds, list) and PRICE_KIND in kinds
+        return ok, "HTTP 200" + ("" if ok else " without price scans")
+    except _Deadline:
+        return None, f"no complete answer within {deadline} s"
+    except urllib.error.HTTPError as e:
+        e.close()
+        if e.code in (404, 405):
+            return False, f"HTTP {e.code}"
+        return None, f"HTTP {e.code}"
+    except ValueError:                          # not JSON: not a server that knows price scans
+        return False, "invalid answer"
+    except (urllib.error.URLError, OSError, http.client.HTTPException, zlib.error, RecursionError) as e:
+        return None, str(getattr(e, "reason", e)) or type(e).__name__
+    finally:
+        _deadline.end = None
+        t = getattr(_deadline, "timer", None)
+        if t is not None:
+            t.cancel()
+            _deadline.timer = None
+
+
+def _market_of(s):
+    mk = s["market"]
+    return "|".join(str(mk[f]) for f in REQUIRED_MARKET)
+
+
+def send_price_scans(pending, sender, st, log, sent_l, sent, info=None, now=None, full_ts=None):
+    """Post the price scans not sent to this target yet, after all full snapshots of
+    the pass. Per market only the newest price scan goes out, and only when no full
+    snapshot of that market is as new (older ones are superseded: marked, not sent);
+    at most PQ_PER_HOUR per target (the server counts them with the full snapshots).
+    Before the first one the server is asked once (GET /health, snapshot_kinds) - an
+    older server would store "listed,low" as a full snapshot without an offer book.
+    Own pause/backoff in the state, kept per target, so a busy server or one without
+    price scans never holds back full snapshots.
+    -> PASS_OK, or PASS_CONFIG on a redirect (wrong URL, same as snapshots)."""
+    now = int(time.time()) if now is None else now
+    full_ts = full_ts or {}
+    target = sender.target
+    if st.get("pqueue_target") != target:            # other URL/outbox: its own pauses
+        st["pqueue_target"] = target
+        st["pqueue_not_before"] = st["pqueue_backoff"] = 0
+        st["pqueue_tries"] = {}
+        st["pqueue_sent_at"] = []
+    newest, stale = {}, []
+    for p, sv in pending:
+        k = price_key(p)
+        if k in sent or not now - PQ_TS_PAST <= p["ts"] <= now + PQ_TS_AHEAD:
+            continue
+        m = _market_of(p)
+        if full_ts.get(m, -1) >= p["ts"]:
+            stale.append(k)                          # a full snapshot is at least as new
+            continue
+        if m in newest:
+            old = newest[m]
+            if old[0]["ts"] >= p["ts"]:
+                stale.append(k)
+                continue
+            stale.append(price_key(old[0]))
+        newest[m] = (p, sv)
+    for k in stale:
+        if k not in sent:
+            sent_l.append(k)
+            sent.add(k)
+    if stale:
+        log(f"{len(stale)} older price scan(s) not sent (a newer scan of the market is there)")
+        save_state(st)
+    todo = sorted(newest.values(), key=lambda e: e[0]["ts"])
+    if not todo:
+        return PASS_OK
+
+    def wait(sec):
+        if info is not None:
+            info["prices_wait"] = max(1, sec)
+
+    nb = st.get("pqueue_not_before", 0)
+    if now < nb:
+        wait(nb - now)
+        return PASS_OK
+    if sender.outbox is None:                        # does the server know price scans?
+        caps = st.setdefault("pqueue_caps", {}).get(target)
+        if not caps or not caps["at"] <= now < caps["at"] + PQ_CAPS_EVERY:
+            ok, msg = fetch_capabilities(health_url(sender.url))
+            if ok is None:
+                back = min(MAX_BACKOFF, max(60, st.get("pqueue_backoff", 0) * 2))
+                st["pqueue_backoff"] = back
+                st["pqueue_not_before"] = now + back
+                save_state(st)
+                log(f"cannot ask the server about price scans ({msg}) - next try in {back // 60} min")
+                wait(back)
+                return PASS_OK
+            caps = st["pqueue_caps"][target] = {"at": now, "ok": ok}
+            while len(st["pqueue_caps"]) > PQ_CAPS_KEEP:
+                del st["pqueue_caps"][next(iter(st["pqueue_caps"]))]
+            save_state(st)
+            if not ok:
+                log(f"the server does not take price scans yet ({msg}) - asking again in 6 h")
+        if not caps["ok"]:
+            wait(caps["at"] + PQ_CAPS_EVERY - now)
+            return PASS_OK
+    tries = st.setdefault("pqueue_tries", {})
+    sent_at = st.setdefault("pqueue_sent_at", [])
+    sent_at[:] = [t for t in sent_at if now - 3600 < t <= now]
+    for i, (p, sv) in enumerate(todo):
+        if len(sent_at) >= PQ_PER_HOUR:              # hourly cap: the rest waits
+            wait(sent_at[0] + 3600 - now)
+            save_state(st)
+            return PASS_OK
+        k = price_key(p)
+        nkey = names_key(target, sv["locale"]) if sv["locale"] else None
+        already = decode_ids(st["names_sent"].get(nkey, "")) if nkey else set()
+        names = names_for(p, sv, already)
+        mkey = meta_key(target, p["market"].get("client"))
+        meta_done = decode_ids(st["meta_sent"].get(mkey, "")) if mkey else set()
+        meta = meta_for(p, sv, meta_done) if mkey else None
+        result, msg = sender.send(payload(p, st["client_id"], names, meta))
+        if result == DROPPED and meta:               # refused with item data: once more without
+            meta = None
+            result, msg = sender.send(payload(p, st["client_id"], names))
+            msg += " (without item data)"
+        code = getattr(sender, "last_code", None)
+        detail = getattr(sender, "last_detail", None) or ""
+        mk = p["market"]
+        extra = f', {len(names["items"])} names' if names else ""
+        if meta:
+            extra += f", {len(meta)} item data"
+        log(f'{result} price scan {mk["client"]}/{mk["region"]}/{mk.get("ruleset")}/'
+            f'{mk["faction"]} {time.strftime("%d.%m. %H:%M", time.localtime(p["ts"]))} '
+            f'{len(p["items"])} items{extra} - {msg}')
+        if result == CONFIG:
+            log("CONFIGURATION ERROR: the server answered with a redirect. "
+                "Nothing is sent until the upload URL is fixed.")
+            return PASS_CONFIG
+        if result == RETRY:                          # 429/5xx/network: backoff 60 s ... 30 min
+            back = min(MAX_BACKOFF, max(60, st.get("pqueue_backoff", 0) * 2))
+            st["pqueue_backoff"] = back
+            st["pqueue_not_before"] = now + back
+            save_state(st)
+            wait(back)
+            return PASS_OK
+        if result == DROPPED and code == 422 and "kind" in detail.lower():
+            n = tries.get(k, 0) + 1                  # server does not know the kind (yet)
+            if n < PQ_GIVE_UP:
+                tries[k] = n
+                while len(tries) > PQ_TRIES_KEEP:
+                    del tries[next(iter(tries))]
+                st["pqueue_not_before"] = now + PQ_UNSUPPORTED_WAIT
+                save_state(st)
+                log("server does not accept price scans yet (HTTP 422) - next try in 1 h")
+                wait(PQ_UNSUPPORTED_WAIT)
+                return PASS_OK
+            log(f"price scan refused {n} times (HTTP 422) - not sent again")
+        tries.pop(k, None)
+        sent_l.append(k)
+        sent.add(k)
+        if result == SENT:
+            if sender.outbox is None:
+                sent_at.append(now)
+            if names:
+                already.update(int(i) for i in names["items"])
+                st["names_sent"][nkey] = encode_ids(already)
+            if meta and meta_acknowledged(sender):
+                meta_done.update(int(i) for i in meta)
+                st["meta_sent"][mkey] = encode_ids(meta_done)
+            if price_scan_confirmed(sender):
+                st["pqueue_backoff"] = 0
+                reply = sender.last_reply
+                if reply.get("status") != "duplicate":   # nothing new on the server: not counted
+                    count_upload(st, p, "prices")
+            else:                                    # older server: stop until it is updated
+                st["pqueue_not_before"] = now + PQ_UNCONFIRMED_WAIT
+                if sender.outbox is None:
+                    st.setdefault("pqueue_caps", {})[target] = {"at": now, "ok": False}
+                save_state(st)
+                log("the server did not confirm the price scan (older server?) - "
+                    "price scans paused for 6 h")
+                if i + 1 < len(todo):
+                    wait(PQ_UNCONFIRMED_WAIT)
+                return PASS_OK
+        save_state(st)
+    return PASS_OK
 
 
 def send_history_blocks(blocks, sender, st, log):
@@ -1115,7 +1622,9 @@ def read_seen(path, now=None):
 
 
 def raw_key(mk):
-    return tuple(mk[k] for k in SEEN_FIELDS)
+    key = tuple(mk[k] for k in SEEN_FIELDS)
+    # Forever market of the server list: no realm name, the ruleset tells them apart
+    return key if mk["realm"] else key + (mk.get("ruleset") or "",)
 
 
 def _seen_of(path, cache):
@@ -1159,12 +1668,412 @@ def flavor_price_dirs(base):
     return out
 
 
-def price_targets(roots, now=None, cache=None):
+REGION_CODES = ("EU", "US", "KR", "TW", "CN")          # server: market.region
+FACTION_NAMES = ("Alliance", "Horde")
+FLAVOR_CLIENT = {"_forever_": "forever", "_classic_era_": "era", "_anniversary_": "era"}
+RULESET_SUFFIX = ("PvE", "PvP", "RP", "RPPvP", "Hardcore")   # as M.MarketInfo() in Midas
+REALM_MAX = 100                         # server: MAX_REALM_LEN
+WTF_DAYS = 30                           # realm folders changed in the last 30 days
+WTF_MAX_REALMS = 5                      # per flavor, newest first (both factions each)
+WTF_MAX_CHARS = 50                      # character folders looked at per realm
+MANUAL_MAX = 10                         # markets added by hand (window)
+NONE_RECHECK = 6 * 3600                 # folder/hand market without server data: ask again after
+PRICE_MAX_QUERIES = 20                  # real export requests per pass (server: 30/min per IP)
+PRICE_FRESH = 29 * 60                   # data asked less than this ago: no new request (30-min cadence)
+_PORTAL_RE = re.compile(r'(?im)^[ \t]*SET[ \t]+portal[ \t]+"?([A-Za-z0-9_-]*)"?')
+_RULESET_TAIL = re.compile(r"([A-Za-z]+)$")
+
+
+def _bad_text(s):
+    """Control characters and invisible format characters (Unicode Cf: zero width,
+    direction overrides) - a realm name never carries them."""
+    return any(ord(c) < 32 or 0x7F <= ord(c) < 0xA0 or unicodedata.category(c) == "Cf" for c in s)
+
+
+def valid_realm_name(name):
+    """Realm name usable as an export parameter (server rules) and as part of the
+    raw key ("|" is the key separator)."""
+    if not isinstance(name, str):
+        return False
+    try:
+        name.encode("utf-8")                  # lone surrogates (odd folder names) cannot be sent
+    except UnicodeError:
+        return False
+    return (name == name.strip() and 0 < len(name) <= REALM_MAX
+            and not _bad_text(name) and "|" not in name)
+
+
+def forever_ruleset(realm):
+    """Ruleset from the realm name suffix, like M.MarketInfo() ("... Realm 7 PvE")."""
+    m = _RULESET_TAIL.search(realm or "")
+    return m.group(1) if m and m.group(1) in RULESET_SUFFIX else "Normal"
+
+
+def market_ruleset(client, realm):
+    return forever_ruleset(realm) if client == "forever" else None
+
+
+def wtf_region(base):
+    """Region of one flavor folder from WTF\\Config.wtf (SET portal "eu").
+    -> "EU"/"US"/"KR"/"TW"/"CN" or None (no file, no portal, unknown value).
+    Cached per file (mtime + size)."""
+    f = Path(base) / "WTF" / "Config.wtf"
+    try:
+        s = f.stat()
+        sig = (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return None
+    hit = _REGION_CACHE.get(str(f))
+    if hit and hit[0] == sig:
+        return hit[1]
+    try:
+        with open(f, "rb") as fh:
+            text = _decode_config(fh.read(1024 * 1024))
+    except OSError:
+        return None
+    region = _portal_region(text)
+    if len(_REGION_CACHE) > 50:
+        _REGION_CACHE.clear()
+    _REGION_CACHE[str(f)] = (sig, region)
+    return region
+
+
+_REGION_CACHE = {}                      # Config.wtf path -> ((mtime_ns, size), region)
+
+
+def _decode_config(raw):
+    """Config.wtf text: UTF-8 (BOM removed) or UTF-16 (with BOM, or NUL bytes without)."""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16", "replace")
+    head = raw[:200]
+    if head and head.count(b"\x00") * 4 >= len(head):        # ASCII text as UTF-16: every 2nd byte NUL
+        return raw.decode("utf-16-be" if raw[:1] == b"\x00" else "utf-16-le", "replace")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    return raw.decode("utf-8", "replace").lstrip("﻿")
+
+
+def _portal_region(text):
+    hits = _PORTAL_RE.findall(text)
+    if not hits:
+        return None
+    v = hits[-1].upper()                      # the game applies the last SET
+    return v if v in REGION_CODES else None
+
+
+def _newest_mtime(realm_dir):
+    """Newest change of a realm folder: the folder, its character folders and the
+    files directly inside them (written at logout). -> (mtime, characters)."""
+    newest = realm_dir.stat().st_mtime
+    chars = 0
+    with os.scandir(realm_dir) as it:
+        subs = [e for e in it if e.is_dir(follow_symlinks=False)
+                and e.name.lower() != "savedvariables"]
+    for e in subs[:WTF_MAX_CHARS]:
+        chars += 1
+        try:
+            newest = max(newest, e.stat().st_mtime)
+            with os.scandir(e.path) as it2:
+                for f in it2:
+                    if f.is_file(follow_symlinks=False):
+                        newest = max(newest, f.stat().st_mtime)
+        except OSError:
+            continue
+    return newest, chars
+
+
+def wtf_realms(base, now=None):
+    """Realm folders of one flavor: WTF\\Account\\<acc>\\<realm>\\<character>.
+    -> ({realm name: newest change}, numbered folders). Folders without a
+    character folder, the SavedVariables folder and files are left out; all
+    accounts are merged. Numbered folders (Forever: realm id, not the name) are
+    only counted."""
+    now = time.time() if now is None else now
+    acc_root = Path(base) / "WTF" / "Account"
+    realms, numbered = {}, 0
+    try:
+        accounts = [a for a in acc_root.iterdir() if a.is_dir()]
+    except OSError:
+        return realms, numbered
+    for acc in accounts:
+        try:
+            entries = [r for r in acc.iterdir() if r.is_dir()]
+        except OSError:
+            continue
+        for r in entries:
+            name = r.name
+            if name.lower() == "savedvariables":
+                continue
+            try:
+                t, chars = _newest_mtime(r)
+            except OSError:
+                continue
+            if not chars or now - t > WTF_DAYS * 86400:
+                continue
+            if name.isdigit():
+                numbered += 1
+                continue
+            if not valid_realm_name(name):
+                continue
+            if realms.get(name, -1) < t:
+                realms[name] = t
+    return realms, numbered
+
+
+def wtf_signature(roots):
+    """Cheap fingerprint of the realm folders and Config.wtf (new realm played,
+    region changed) -> a price check without waiting 30 minutes."""
+    out = []
+    for root in roots:
+        for flavor in PRICE_FLAVORS:
+            wtf = Path(root) / flavor / "WTF"
+            try:
+                out.append((str(wtf), (wtf / "Config.wtf").stat().st_mtime_ns))
+            except OSError:
+                out.append((str(wtf), None))
+            try:
+                for acc in sorted((wtf / "Account").iterdir()):
+                    if acc.is_dir():
+                        out.append((acc.name, tuple(sorted(r.name for r in acc.iterdir() if r.is_dir()))))
+            except OSError:
+                pass
+    return tuple(out)
+
+
+def clean_manual_market(e):
+    """Validated market added by hand -> {flavor, region, realm, faction, added}.
+    faction "Both" asks both factions. Raises ValueError(<reason>)."""
+    if not isinstance(e, dict):
+        raise ValueError("bad")
+    fl = e.get("flavor")
+    if fl not in FLAVOR_CLIENT:
+        raise ValueError("flavor")
+    region = e.get("region")
+    if not isinstance(region, str) or region.strip().upper() not in REGION_CODES:
+        raise ValueError("region")
+    realm = e.get("realm")
+    realm = realm.strip() if isinstance(realm, str) else ""
+    if not valid_realm_name(realm):
+        raise ValueError("realm")
+    fac = e.get("faction")
+    fac = fac.strip().capitalize() if isinstance(fac, str) else ""
+    if fac not in FACTION_NAMES + ("Both",):
+        raise ValueError("faction")
+    added = e.get("added")
+    return {"flavor": fl, "region": region.strip().upper(), "realm": realm, "faction": fac,
+            "added": added if type(added) is int and added >= 0 else 0}
+
+
+def manual_id(e):
+    key = "|".join((e["flavor"], e["region"], e["realm"].casefold(), e["faction"]))
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:12]
+
+
+def add_manual_market(lst, e, now=None):
+    """-> new list with e (validated) appended. ValueError("full"/"dup"/<field>)."""
+    c = clean_manual_market(e)               # complete check (incl. encodable) before keeping it
+    c["added"] = int(time.time()) if now is None else now
+    mid = manual_id(c)
+    if any(manual_id(x) == mid for x in lst):
+        raise ValueError("dup")
+    if len(lst) >= MANUAL_MAX:
+        raise ValueError("full")
+    return list(lst) + [c]
+
+
+def remove_manual_market(lst, mid):
+    return [x for x in lst if manual_id(x) != mid]
+
+
+def _raw_market(client, region, realm, faction, last, src):
+    return {"client": client, "region": region, "realm": realm, "faction": faction,
+            "ruleset": market_ruleset(client, realm), "last": int(last), "src": src}
+
+
+LIST_EVERY = 6 * 3600                   # market list of the server: asked at most this often
+LIST_RETRY = 30 * 60                    # after a failed request
+LIST_MAX_BYTES = 1024 * 1024            # answer (wire and unpacked)
+LIST_MAX_ENTRIES = 5000                 # entries looked at
+LIST_KEEP = 100                         # Forever markets kept in the state
+LIST_MAX_MARKETS = 4                    # Forever markets of the region that are fetched
+_RULESET_RE = re.compile(r"[A-Za-z]{1,20}", re.ASCII)
+
+
+def markets_url(export_base):
+    """.../api/v1/export -> .../api/v1/markets"""
+    return export_base[: -len("export")] + "markets" if export_base.endswith("/export") else None
+
+
+def clean_market_list(obj):
+    """Validated Forever part of GET /markets -> [{key, region, ruleset, faction, last_ts}]
+    (newest first, at most LIST_KEEP) or None when the answer is not a list. Entries
+    of other clients and entries that do not fit the Forever key are left out."""
+    if not isinstance(obj, list):
+        return None
+    out, seen = [], set()
+    for e in obj[:LIST_MAX_ENTRIES]:
+        if not isinstance(e, dict) or e.get("client") != "forever":
+            continue
+        key, region, rs, fac, ts = (e.get(k) for k in ("key", "region", "ruleset", "faction", "last_ts"))
+        if not (isinstance(key, str) and _MARKET_RE.fullmatch(key) and region in REGION_CODES
+                and isinstance(rs, str) and _RULESET_RE.fullmatch(rs)
+                and isinstance(fac, str) and fac.capitalize() in FACTION_NAMES
+                and type(ts) is int and 0 <= ts < 2 ** 40):
+            continue
+        fac = fac.capitalize()
+        if key != f"forever/{region}/{rs.lower()}/{fac.lower()}" or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "client": "forever", "region": region, "ruleset": rs, "faction": fac,
+                    "last_ts": ts})                   # same shape as the answer: the state cache reloads
+    out.sort(key=lambda m: (-m["last_ts"], m["key"]))
+    return out[:LIST_KEEP]
+
+
+def fetch_market_list(url, timeout=None, deadline=None):
+    """GET /markets -> (list or None, info). Same guards as the export: no redirect,
+    one deadline for connect, headers and body, gzip unpacked with a size limit."""
+    timeout = PRICE_TIMEOUT if timeout is None else timeout
+    deadline = PRICE_DEADLINE if deadline is None else deadline
+    end = _clock() + deadline
+    req = urllib.request.Request(url, headers={"Accept": "application/json", "Accept-Encoding": "gzip",
+                                               "User-Agent": f"MidasUplink/{VERSION}"}, method="GET")
+    _deadline.end = end
+    try:
+        with _opener.open(req, timeout=timeout) as r:
+            if r.status != 200:
+                return None, f"HTTP {r.status}"
+            raw = _read_body(r, end, LIST_MAX_BYTES)
+        lst = clean_market_list(json.loads(raw.decode("utf-8")))
+        if lst is None:
+            return None, "invalid market list"
+        return lst, f"HTTP 200, {len(lst)} Forever markets"
+    except _Deadline:
+        return None, f"no complete answer within {deadline} s"
+    except urllib.error.HTTPError as e:
+        e.close()
+        if 300 <= e.code < 400:
+            return None, f"HTTP {e.code} redirect - check --url / MIDAS_UPLINK_URL"
+        return None, f"HTTP {e.code}"
+    except (urllib.error.URLError, OSError, http.client.HTTPException, ValueError, zlib.error,
+            RecursionError) as e:
+        return None, str(getattr(e, "reason", e)) or type(e).__name__
+    finally:
+        _deadline.end = None
+        t = getattr(_deadline, "timer", None)
+        if t is not None:
+            t.cancel()
+            _deadline.timer = None
+
+
+def server_forever_markets(base, st, now, calls=None, fetch=True):
+    """Forever markets of the server list from the state cache; asked again when
+    older than LIST_EVERY (LIST_RETRY after a failure). A failed request keeps the
+    last known list. fetch=False (window): cache only."""
+    url = markets_url(base or "")
+    if not url:
+        return []
+    ml = st["markets_list"]
+    same = ml["base"] == url
+    known = ml["forever"] if same else []
+    if not fetch:
+        return known
+    if same and (0 <= now - ml["at"] < LIST_EVERY or 0 <= now - ml["tried"] < LIST_RETRY):
+        return known
+    if calls is not None:
+        calls.append(1)
+    lst, info = fetch_market_list(url)
+    if lst is None:
+        _log.info(f"server prices: market list - {info}")
+        st["markets_list"] = {"base": url, "at": ml["at"] if same else 0, "tried": now, "forever": known}
+        return known
+    st["markets_list"] = {"base": url, "at": now, "tried": now, "forever": lst}
+    return lst
+
+
+def list_markets_for(region, forever):
+    """Raw markets (no realm name, src "list") for the newest Forever markets of a region."""
+    hits = [m for m in forever if m["region"] == region][:LIST_MAX_MARKETS]
+    return [{"client": "forever", "region": m["region"], "realm": "", "faction": m["faction"],
+             "ruleset": m["ruleset"], "last": m["last_ts"], "src": "list", "market": m["key"]}
+            for m in hits]
+
+
+WTF_CACHE_TTL = 30                      # window polls every 3 s: realm folders read at most every 30 s
+
+
+def _wtf_realms_cached(base, now, cache):
+    if cache is None:
+        return wtf_realms(base, now)
+    key, t = str(base), time.monotonic()
+    hit = cache.get(key)
+    if hit and 0 <= t - hit[0] < WTF_CACHE_TTL:
+        return hit[1]
+    res = wtf_realms(base, now)
+    cache[key] = (t, res)
+    return res
+
+
+def extra_markets(root, flavor, seen, manual=(), now=None, wtf_cache=None, server_list=None):
+    """Markets of one flavor that add to the seen ones: added by hand (state) and
+    taken from the game folder (realm folders + region, both factions) for realms
+    without a seen entry. -> (markets, info). info: region, realms (derived),
+    numbered (Forever realm id folders), no_region, manual (count), listed (count).
+    Forever without any seen market, with a region and a realm folder (numbers
+    included): the newest Forever markets of the server list for that region
+    (server_list: callable -> validated list, called only when needed)."""
+    now = int(time.time()) if now is None else now
+    client = FLAVOR_CLIENT.get(flavor)
+    base = Path(root) / flavor
+    info = {"region": None, "realms": [], "numbered": 0, "no_region": False, "manual": 0, "listed": 0}
+    if client is None:
+        return [], info
+    keys = {raw_key(m) for m in seen}
+    seen_realms = {m["realm"].casefold() for m in seen}
+    out = []
+    for e in manual:
+        if e.get("flavor") != flavor:
+            continue
+        info["manual"] += 1
+        facs = FACTION_NAMES if e["faction"] == "Both" else (e["faction"],)
+        for fac in facs:
+            m = _raw_market(client, e["region"], e["realm"], fac, now, "manual")
+            if raw_key(m) not in keys:
+                keys.add(raw_key(m))
+                out.append(m)
+    realms, info["numbered"] = _wtf_realms_cached(base, now, wtf_cache)
+    if not realms and not info["numbered"]:
+        return out, info
+    region = wtf_region(base)
+    info["region"] = region
+    if region is None:
+        info["no_region"] = True
+        return out, info
+    if flavor == "_forever_" and not seen and server_list is not None:
+        for m in list_markets_for(region, server_list() or []):
+            if raw_key(m) not in keys:
+                keys.add(raw_key(m))
+                out.append(m)
+                info["listed"] += 1
+    fresh = sorted(((t, r) for r, t in realms.items() if r.casefold() not in seen_realms),
+                   key=lambda x: (-x[0], x[1]))[:WTF_MAX_REALMS]
+    for t, realm in fresh:
+        info["realms"].append(realm)
+        for fac in FACTION_NAMES:
+            m = _raw_market(client, region, realm, fac, t, "wtf")
+            if raw_key(m) not in keys:
+                keys.add(raw_key(m))
+                out.append(m)
+    return out, info
+
+
+def price_targets(roots, now=None, cache=None, manual=(), server_list=None):
     """-> ([(addon folder, [raw market, ...]), ...], complete).
     Every Prices.lua folder (flavor_price_dirs) of the price flavors, with the
     markets seen there in the last 30 days (may be empty: the file is then written
-    with markets = {}). complete=False when a SV file could not be read (that
-    flavor is skipped this time)."""
+    with markets = {}), then markets added by hand and those taken from the realm
+    folders of the game (extra_markets). complete=False when a SV file could not be
+    read (that flavor is skipped this time)."""
     now = int(time.time()) if now is None else now
     out, complete = [], True
     for root in roots:
@@ -1190,6 +2099,12 @@ def price_targets(roots, now=None, cache=None):
                 continue
             recent = sorted(markets.values(), key=lambda m: (-m["last"], raw_key(m)))
             chosen = sorted(recent[:PRICE_MAX_MARKETS], key=raw_key)
+            try:
+                extra, _info = extra_markets(root, flavor, list(markets.values()), manual, now,
+                                             server_list=server_list)
+            except OSError:
+                extra = []
+            chosen = chosen + extra
             for d in dirs:
                 out.append((d, chosen))
     return out, complete
@@ -1222,7 +2137,8 @@ def clean_price_tmp(roots, max_age=PRICE_TMP_AGE, now=None):
 
 
 def export_params(mk):
-    params = [(k, mk[k]) for k in SEEN_FIELDS]
+    # a Forever market of the server list has no realm name: client, region, faction + ruleset
+    params = [(k, mk[k]) for k in SEEN_FIELDS if k != "realm" or mk[k]]
     if mk.get("ruleset"):
         params.append(("ruleset", mk["ruleset"]))
     return params
@@ -1282,12 +2198,13 @@ class _Deadline(Exception):
     pass
 
 
-def _read_body(r, deadline):
-    """Read at most PRICE_MAX_PACKED bytes from the wire and PRICE_MAX_BYTES unpacked,
-    unpacking gzip on the fly; stop at the deadline."""
+def _read_body(r, deadline, limit=None):
+    """Read at most PRICE_MAX_PACKED bytes from the wire and PRICE_MAX_BYTES unpacked
+    (both `limit` when given), unpacking gzip on the fly; stop at the deadline."""
     gz = (r.headers.get("Content-Encoding") or "").lower() == "gzip"
     dec = zlib.decompressobj(16 + zlib.MAX_WBITS) if gz else None
-    wire_max = PRICE_MAX_PACKED if gz else PRICE_MAX_BYTES
+    PRICE_MAX_BYTES = limit or globals()["PRICE_MAX_BYTES"]
+    wire_max = limit or (PRICE_MAX_PACKED if gz else PRICE_MAX_BYTES)
     raw_n, out = 0, []
     size = 0
     while True:
@@ -1334,7 +2251,7 @@ def retry_after_seconds(value, now=None):
     return max(0, int(when.timestamp() - now))
 
 
-def fetch_export(base, mk, etag=None, timeout=None, deadline=None, days=EXPORT_DAYS):
+def fetch_export(base, mk, etag=None, timeout=None, deadline=None, days=EXPORT_DAYS, calls=None):
     """GET the export of one raw market (days=90; a server that rejects it with 422 is
     asked once more without days, i.e. its 14-day default).
     -> (P_OK|P_SAME|P_NONE|P_ERROR, data, etag, info, retry_after seconds or None)
@@ -1343,10 +2260,13 @@ def fetch_export(base, mk, etag=None, timeout=None, deadline=None, days=EXPORT_D
     get a fresh 60 s)."""
     deadline = PRICE_DEADLINE if deadline is None else deadline
     end = _clock() + deadline
+    calls = [] if calls is None else calls        # one entry per HTTP request (rate limit)
+    calls.append(1)
     res = _fetch_export(base, mk, etag, timeout, deadline, end, days)
     if days and res[0] == P_NONE and res[3].startswith("HTTP 422"):
         if _clock() >= end:
             return P_ERROR, None, None, f"no complete answer within {deadline} s", None
+        calls.append(1)
         res = _fetch_export(base, mk, etag, timeout, deadline, end, None)
     return res
 
@@ -1457,7 +2377,7 @@ def merge_markets(results):
                  "items": data["items"], "match": g["match"] if g else []}
             groups[data["market"]] = g
         m = {k: mk[k] for k in SEEN_FIELDS}
-        if m not in g["match"]:
+        if mk.get("src") != "list" and m not in g["match"]:   # server list: match = {}, found via market
             g["match"].append(m)
         g["last"] = max(g.get("last", 0), mk.get("last") or 0)
     for g in groups.values():
@@ -1573,8 +2493,11 @@ def write_prices(addon_dir, markets, now=None, checked=None):
     return "written"
 
 
-def run_prices(roots, url, st, log, now=None, cache=None):
+def run_prices(roots, url, st, log, now=None, cache=None, stats=None, force=False):
     """One downlink pass. -> (PASS_OK|PASS_RETRY|PASS_CONFIG, summary text).
+    stats (dict, optional) gets "requests", "deferred" (left for the next pass) and
+    "never" (deferred and never asked). force (--prices-now): also ask markets checked
+    lately (the request cap still applies).
     On any fetch error the affected Prices.lua files stay as they are."""
     now = int(time.time()) if now is None else now
     base = export_url(url)
@@ -1587,7 +2510,14 @@ def run_prices(roots, url, st, log, now=None, cache=None):
                + time.strftime("%d.%m. %H:%M", time.localtime(st["prices_not_before"])))
         _log.info(msg)
         return PASS_RETRY, msg
-    targets, complete = price_targets(roots, now, cache)
+    calls, deferred, never = [], 0, 0  # real requests (422 fallback = 2), left over, never asked
+    listed = {}
+
+    def server_list():                  # asked once per pass, and only when a Forever folder needs it
+        if "v" not in listed:
+            listed["v"] = server_forever_markets(base, st, now, calls)
+        return listed["v"]
+    targets, complete = price_targets(roots, now, cache, st.get("manual_markets") or (), server_list)
     etags = st["prices_etag"]
     pmap = st["prices_market"]          # query key -> server market key (last answer)
     checked = st["prices_checked"]      # query key -> last real request (unix)
@@ -1597,54 +2527,86 @@ def run_prices(roots, url, st, log, now=None, cache=None):
     failed_all = False
     n_written = n_same = 0
     info_out = {}                       # server market -> {ts, items} (window)
+    # 1. decide every query once: never asked first, then the oldest check (rotation
+    #    under the request cap); data asked < PRICE_FRESH ago comes from the cache
+    first = {}
+    for _addon, markets in targets:
+        for mk in markets:
+            try:
+                q = query_key(base, mk)
+            except UnicodeError:            # not encodable (lone surrogate): skip the market
+                continue
+            used.add(q)
+            first.setdefault(q, mk)
+    for q in sorted(first, key=lambda k: (k in checked, checked.get(k, 0))):
+        mk = first[q]
+        known = pmap.get(q)
+        age = now - checked[q] if q in checked else None
+        guessed = mk.get("src") in ("wtf", "manual", "list")
+        cached = load_price_cache(q)
+        if known in fresh and age is not None and 0 <= age < PRICE_RECHECK:
+            fetched[q] = (P_OK, fresh[known])         # sibling raw market already brought it
+            continue
+        if failed_all:
+            fetched[q] = (P_ERROR, None)
+            continue
+        if not force and known is not None and cached and age is not None and 0 <= age < PRICE_FRESH:
+            fetched[q] = (P_SAME, cached)             # asked lately, data known: no request
+            fresh.setdefault(known, cached)
+            continue
+        if not force and guessed and known is None and age is not None and 0 <= age < NONE_RECHECK:
+            fetched[q] = (P_NONE, cached)             # no data there lately: no request
+            continue
+        if len(calls) >= PRICE_MAX_QUERIES:           # server limit: the rest next pass
+            deferred += 1
+            never += age is None
+            fetched[q] = (P_SAME, cached) if cached else (P_NONE, None)
+            continue
+        status, data, etag, info, wait = fetch_export(base, mk, etags.get(q) if cached else None,
+                                                      calls=calls)
+        if status != P_ERROR:
+            checked[q] = now
+        elif wait is not None and wait > PRICES_EVERY:
+            st["prices_not_before"] = now + min(wait, RETRY_AFTER_MAX)
+            info += f", Retry-After {wait} s"
+        if status == P_OK:
+            try:
+                save_price_cache(q, data)
+            except OSError:
+                pass
+            if etag:
+                etags[q] = etag
+            else:
+                etags.pop(q, None)
+        elif status in (P_SAME, P_NONE):
+            data = cached                 # 404/400/422: keep the last known prices
+            if status == P_SAME and data is None:
+                status, info = P_ERROR, "HTTP 304 without cached data"
+        if status in (P_OK, P_SAME):
+            pmap[q] = data["market"]
+            fresh[data["market"]] = data
+        elif status == P_NONE:
+            _log.info(f'server prices: {mk["client"]}/{mk["region"]}/{mk["realm"]}/'
+                      f'{mk["faction"]} - {info}')
+        else:
+            failed_all = True             # offline / server trouble: stop here
+            log(f'server prices: {mk["client"]}/{mk["region"]}/{mk["realm"]}/'
+                f'{mk["faction"]} - {info}; old files stay')
+        fetched[q] = (status, data)
+    # 2. write every Prices.lua folder from the answers
     for addon, markets in targets:
         results, failed = [], False
         for mk in markets:
-            q = query_key(base, mk)
-            used.add(q)
-            if q not in fetched:
-                known = pmap.get(q)
-                recent = 0 <= now - checked.get(q, 0) < PRICE_RECHECK
-                if known in fresh and recent:   # sibling raw market already brought it
-                    fetched[q] = (P_OK, fresh[known])
-                elif failed_all:
-                    fetched[q] = (P_ERROR, None)
-                else:
-                    cached = load_price_cache(q)
-                    status, data, etag, info, wait = fetch_export(base, mk, etags.get(q) if cached else None)
-                    if status != P_ERROR:
-                        checked[q] = now
-                    elif wait is not None and wait > PRICES_EVERY:
-                        st["prices_not_before"] = now + min(wait, RETRY_AFTER_MAX)
-                        info += f", Retry-After {wait} s"
-                    if status == P_OK:
-                        try:
-                            save_price_cache(q, data)
-                        except OSError:
-                            pass
-                        if etag:
-                            etags[q] = etag
-                        else:
-                            etags.pop(q, None)
-                    elif status in (P_SAME, P_NONE):
-                        data = cached                 # 404/400/422: keep the last known prices
-                        if status == P_SAME and data is None:
-                            status, info = P_ERROR, "HTTP 304 without cached data"
-                    if status in (P_OK, P_SAME):
-                        pmap[q] = data["market"]
-                        fresh[data["market"]] = data
-                    elif status == P_NONE:
-                        _log.info(f'server prices: {mk["client"]}/{mk["region"]}/{mk["realm"]}/'
-                                  f'{mk["faction"]} - {info}')
-                    else:
-                        failed_all = True             # offline / server trouble: stop here
-                        log(f'server prices: {mk["client"]}/{mk["region"]}/{mk["realm"]}/'
-                            f'{mk["faction"]} - {info}; old files stay')
-                    fetched[q] = (status, data)
+            try:
+                q = query_key(base, mk)
+            except UnicodeError:
+                continue
             status, data = fetched[q]
             if status == P_ERROR:
                 failed = True
                 break
+            if data and mk.get("src") == "list" and data["market"] != mk.get("market"):
+                continue                              # not the market that was asked for
             if data:
                 results.append((mk, data))
         if failed:
@@ -1675,6 +2637,11 @@ def run_prices(roots, url, st, log, now=None, cache=None):
                 f"{sum(len(g['items']) for g in merged)} items)")
         elif res == "unchanged":
             n_same += 1
+    if stats is not None:
+        stats["requests"], stats["deferred"], stats["never"] = len(calls), deferred, never
+    if deferred:
+        _log.info(f"server prices: {deferred} markets left for the next check "
+                  f"(at most {PRICE_MAX_QUERIES} requests per check)")
     if result == PASS_OK:
         st["prices_last"] = now
         st["prices_etag"] = {q: e for q, e in etags.items() if q in used}
@@ -1706,6 +2673,7 @@ class Watcher:
         self.mtimes = {}
         self.backoff = 0
         self.last_result = None
+        self.pq_due = None                  # monotonic time to try waiting price scans again
         self.prices_every = prices_every
         self.prices_due = 0.0               # monotonic time of the next server-price check
         self.prices_ran = None              # monotonic time of the last check
@@ -1714,6 +2682,7 @@ class Watcher:
         self.prices_sig = None
         self.seen_cache = {}
         self._req = None                    # pending switch from the tray thread
+        self._manual_req = None             # pending list of markets added by hand
         self._req_lock = threading.Lock()
         clean_price_tmp(roots)
 
@@ -1726,7 +2695,29 @@ class Watcher:
         with self._req_lock:
             self._req = bool(on)
 
+    def manual_markets(self):
+        """Markets added by hand, including a change not applied yet."""
+        with self._req_lock:
+            return list(self.st["manual_markets"] if self._manual_req is None else self._manual_req)
+
+    def set_manual(self, markets):
+        """Thread-safe (window): new list of markets added by hand, applied by the
+        next step(), followed by a price check."""
+        with self._req_lock:
+            self._manual_req = list(markets)
+
     def _apply_request(self):
+        with self._req_lock:
+            man, self._manual_req = self._manual_req, None
+            if man is not None and man != self.st["manual_markets"]:
+                self.st["manual_markets"] = man
+            else:
+                man = None
+        if man is not None:
+            save_state(self.st)
+            self.log(f"markets added by hand: {len(man)}")
+            # check soon, but not twice within PRICES_MIN_GAP (server: 30 requests/min)
+            self.prices_due = 0.0 if self.prices_ran is None else self.prices_ran + PRICES_MIN_GAP
         with self._req_lock:
             req, self._req = self._req, None
             if req is None or req == self.st["prices_enabled"]:
@@ -1747,15 +2738,19 @@ class Watcher:
                 out.append((str(d), s.st_mtime_ns, s.st_size))
             except OSError:
                 out.append((str(d), None, None))
+        out.append(wtf_signature(self.roots))   # 1.3.1: new realm folder / region
         return tuple(out)
 
     def check_prices(self):
         self.prices_ran = time.monotonic()
         self.prices_due = self.prices_ran + self.prices_every
         try:
+            stats = {}
             self.prices_result, summary = run_prices(self.roots, self.sender.url, self.st,
-                                                     self.log, cache=self.seen_cache)
+                                                     self.log, cache=self.seen_cache, stats=stats)
             self.prices_summary = summary
+            if stats.get("never"):                # markets never asked yet: after the minimum gap
+                self.prices_due = self.prices_ran + PRICES_MIN_GAP
             _log.info(summary)
         except Exception as e:  # noqa: BLE001 -- the upload loop must keep running
             _log.exception("server prices failed")
@@ -1791,8 +2786,12 @@ class Watcher:
             if self.mtimes.get(p) != m:
                 self.mtimes[p] = m
                 changed = True
-        if changed or self.backoff or force:
-            res = run_pass(self.roots, self.sender, self.st, self.log)
+        pq_due = self.pq_due is not None and time.monotonic() >= self.pq_due
+        if changed or self.backoff or force or pq_due:
+            info = {}
+            res = run_pass(self.roots, self.sender, self.st, self.log, info)
+            w = info.get("prices_wait")
+            self.pq_due = None if w is None else time.monotonic() + w
             self.last_result = res
             self.last_ran = True
             if res == PASS_OK:
@@ -1834,7 +2833,7 @@ def main(argv=None):
     if a.prices_now:
         clean_price_tmp(roots)
         st = load_state()
-        res, summary = run_prices(roots, a.url, st, log)
+        res, summary = run_prices(roots, a.url, st, log, force=True)
         log(summary)
         return 0 if res == PASS_OK else 1
     log("watching: " + "; ".join(str(r) for r in roots))

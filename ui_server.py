@@ -39,7 +39,7 @@ STATIC = {"app.css": ("app.css", "text/css; charset=utf-8"),
           "logo.png": ("logo.png", "image/png")}
 CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; "
        "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
-ACTIONS = ("send", "autostart", "prices", "folder", "pick", "open")
+ACTIONS = ("send", "autostart", "prices", "folder", "pick", "open", "market_add", "market_del")
 
 
 def ui_dir():

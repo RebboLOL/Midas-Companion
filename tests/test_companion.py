@@ -282,7 +282,7 @@ def test_watcher_rewrites_placeholder_without_waiting(tmp_path, xs, monkeypatch)
     (midas / "Prices.lua").write_text("MidasUplinkPrices = nil\n", encoding="ascii")
     clock["t"] += 30
     w.step()
-    assert len(xs.requests) == 2 and len(lua_load(midas / "Prices.lua").markets) == 1
+    assert len(xs.requests) == 1 and len(lua_load(midas / "Prices.lua").markets) == 1   # from the cache
 
 
 def test_normalize_wow_dir(tmp_path):
@@ -304,7 +304,7 @@ def test_state_fields_type_checked(own_appdata):
         "prices_info": {"m": {"ts": 1, "items": 3}, "n": [1]},
         "wow_dirs": ["C:\\WoW", 5, ""], "window_shown": "yes"}), encoding="utf-8")
     st = U.load_state()
-    assert st["upload_markets"] == {"a": {"ts": 1, "at": 2}}
+    assert st["upload_markets"] == {"a": {"ts": 1, "at": 2, "kind": "full"}}   # 1.3.1 (19.11.): kind
     assert st["prices_info"] == {"m": {"ts": 1, "items": 3}}
     assert st["wow_dirs"] == ["C:\\WoW"] and st["window_shown"] is False
 

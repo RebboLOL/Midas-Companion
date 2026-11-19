@@ -119,6 +119,15 @@ button.pill:hover { border-color: var(--borderlt); color: var(--gold); }
 .fa-alliance { color: #6d9bff; }
 .fa-horde { color: #ff5a43; }
 .empty { padding: 8px 0; }
+.tbl .src { color: var(--muted); font-size: 11.5px; font-style: italic; }
+.addm { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 8px; }
+.addm select, .addm input { min-height: 34px; padding: 6px 10px; border-radius: 9px; border: 1px solid var(--line);
+  background: rgba(13, 11, 8, .8); color: inherit; font: inherit; font-size: 13px; }
+.addm input { flex: 1; min-width: 160px; }
+.addm select:focus, .addm input:focus { border-color: var(--borderlt); outline: none; }
+.manual { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.manual li { display: flex; align-items: center; gap: 10px; }
+.manual li span { flex: 1; overflow-wrap: anywhere; }
 
 /* actions */
 .actions { display: flex; flex-direction: column; gap: 12px; }
