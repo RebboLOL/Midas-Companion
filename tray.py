@@ -586,6 +586,7 @@ class App:
         self.ui = None
         self.cache = SvCache()
         self._dir_req = []
+        self._picked = []                            # folders chosen in the window during this run
         self._lock = threading.Lock()
         self._state_lock = threading.Lock()          # watcher (re)creation vs. direct state writes
         self._pick_lock = threading.Lock()
@@ -607,46 +608,38 @@ class App:
 
     def find_roots(self):
         if self.only_wow:
-            return [Path(d) for d in self.only_wow if Path(d).is_dir()]
+            return [Path(d) for d in self.only_wow if U.is_dir(d)]
         st = self.state()
-        return U.wow_roots(self.wow + st.get("wow_dirs", []))
+        dirs = self.wow + st.get("wow_dirs", [])
+        return U.wow_roots(dirs + [d for d in self._picked if d not in dirs])
 
     def _apply_dir_requests(self):
         with self._lock:
             reqs, self._dir_req = self._dir_req, []
         if not reqs:
             return
+        # kept in memory too: the choice counts for this run even when the state
+        # cannot be written
+        self._picked += [d for d in reqs if d not in self._picked]
         with self._state_lock:
-            if self.watcher:
-                self.watcher._apply_request()       # pending window changes go into the state first
-            st = self.state()
-            for d in reqs:
-                if d not in st["wow_dirs"]:
-                    st["wow_dirs"].append(d)
-                    self.log.info(f"World of Warcraft folder added: {d}")
-            U.save_state(st)
-            self.watcher = None                      # rebuilt with the new roots
+            try:
+                if self.watcher:
+                    self.watcher._apply_request()   # pending window changes go into the state first
+                st = self.state()
+                for d in reqs:
+                    if d not in st["wow_dirs"]:
+                        st["wow_dirs"].append(d)
+                        self.log.info(f"World of Warcraft folder added: {d}")
+                U.save_state(st)
+            finally:
+                self.watcher = None                  # rebuilt with the new roots
 
     def loop(self):
         self.log.info(f"{APP_NAME} {U.VERSION} start, url {self.url}")
         try:
             while not self.stop.is_set():
-                self._apply_dir_requests()
-                if self.watcher is None:
-                    roots = self.find_roots()
-                    self.roots = roots
-                    if roots:
-                        self.log.info("watching: " + "; ".join(str(r) for r in roots))
-                        with self._state_lock:              # no direct state write in between
-                            self.watcher = U.Watcher(roots, U.Sender(self.url), self.note, self.interval)
-                    else:
-                        self.note(self.t["nowow"])
-                        self.wake.wait(300)
-                        self.wake.clear()
-                        continue
-                force, self.force = self.force, False
                 try:
-                    wait = self.watcher.step(force=force)
+                    wait = self._pass()
                 except Exception as e:  # noqa: BLE001 -- keep the loop alive
                     self.log.exception("pass failed")
                     self.status = str(e)[:60]
@@ -655,6 +648,26 @@ class App:
                 self.wake.clear()
         finally:
             self.log.info("stop")
+
+    def _pass(self):
+        """One round of the background thread -> seconds until the next one. The
+        folder search runs inside the loop's error handling as well: an error
+        there must never end the thread (the window would stay on "folder not
+        found" and ignore every folder chosen by hand)."""
+        self._apply_dir_requests()
+        if self.watcher is None:
+            roots = self.find_roots()
+            self.roots = roots
+            if not roots:
+                self.note(self.t["nowow"])
+                return 300
+            self.log.info("watching: " + "; ".join(str(r) for r in roots))
+            with self._state_lock:                      # no direct state write in between
+                self.watcher = U.Watcher(roots, U.Sender(self.url), self.note, self.interval)
+                dirs = self.watcher.st["wow_dirs"]      # a choice that could not be saved yet
+                dirs += [d for d in self._picked if d not in dirs]      # goes out with the next save
+        force, self.force = self.force, False
+        return self.watcher.step(force=force)
 
     # ---- window backend (ui_server) ---------------------------------------- #
     def manual_markets(self):

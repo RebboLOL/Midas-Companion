@@ -93,7 +93,7 @@ import uuid
 import zlib
 from pathlib import Path
 
-VERSION = "1.3.1"
+VERSION = "1.3.2"
 APP_NAME = "Midas Companion"
 DEFAULT_URL = "https://midasmarket.app/api/v1/snapshots"
 LOCAL_URL = "http://127.0.0.1:8000/api/v1/snapshots"     # 0.1.0/0.2.0 default
@@ -415,20 +415,59 @@ def load_uplink_db(path):
 # --------------------------------------------------------------------------- #
 # Discovery
 # --------------------------------------------------------------------------- #
+WOW_PLACES = ("Program Files (x86)\\World of Warcraft", "Program Files\\World of Warcraft",
+              "World of Warcraft", "Games\\World of Warcraft", "Blizzard\\World of Warcraft",
+              "Battle.net\\World of Warcraft")
+DRIVE_TYPES = (2, 3, 6)     # removable, fixed, RAM disk
+
+
+def is_dir(p):
+    """Folder check that never raises. pathlib's exists()/is_dir() pass most
+    Windows errors on (locked or unreadable drive, lost network drive, access
+    denied) - one such drive letter must not end the folder search."""
+    try:
+        return os.path.isdir(p)
+    except (OSError, ValueError):
+        return False
+
+
+def local_drives():
+    """Drive letters worth a look. Windows: the drives that exist, without network
+    drives and CD-ROMs (a lost mapping can block for a long time; a folder there
+    can still be chosen by hand). Elsewhere or on any error: A-Z."""
+    try:
+        import ctypes
+        k = ctypes.WinDLL("kernel32")           # own instance: argtypes stay private
+        k.GetLogicalDrives.restype = ctypes.c_uint32
+        k.GetDriveTypeW.argtypes = (ctypes.c_wchar_p,)
+        k.GetDriveTypeW.restype = ctypes.c_uint
+        mask = k.GetLogicalDrives()
+        if mask:
+            return [d for i, d in enumerate(string.ascii_uppercase)
+                    if mask >> i & 1 and k.GetDriveTypeW(f"{d}:\\") in DRIVE_TYPES]
+    except (AttributeError, ImportError, OSError, ValueError):
+        pass
+    return list(string.ascii_uppercase)
+
+
 def wow_roots(extra):
-    cands = [Path(e) for e in extra]
-    for d in string.ascii_uppercase:
-        base = Path(f"{d}:\\")
-        if not base.exists():
+    """World of Warcraft folders: the given ones first (chosen by the user), then
+    the usual places on every local drive. Never raises - what cannot be read is
+    skipped."""
+    cands = []
+    for e in extra:
+        try:
+            cands.append(Path(e))
+        except (TypeError, ValueError):
             continue
-        for rel in ("Program Files (x86)\\World of Warcraft", "Program Files\\World of Warcraft",
-                    "World of Warcraft", "Games\\World of Warcraft", "Blizzard\\World of Warcraft",
-                    "Battle.net\\World of Warcraft"):
-            cands.append(base / rel)
+    for d in local_drives():
+        base = Path(f"{d}:\\")
+        if is_dir(base):
+            cands += [base / rel for rel in WOW_PLACES]
     seen, roots = set(), []
     for c in cands:
         key = str(c).lower()
-        if key not in seen and c.is_dir():
+        if key not in seen and is_dir(c):
             seen.add(key)
             roots.append(c)
     return roots
@@ -861,6 +900,9 @@ def load_state():
             raw = f.read_text(encoding="utf-8")
             break
         except FileNotFoundError:
+            break
+        except UnicodeDecodeError as e:            # not UTF-8: as unreadable as broken JSON
+            _keep_corrupt(f, e)
             break
         except PermissionError:
             if attempt == 4:
@@ -1671,7 +1713,7 @@ def flavor_price_dirs(base):
 REGION_CODES = ("EU", "US", "KR", "TW", "CN")          # server: market.region
 FACTION_NAMES = ("Alliance", "Horde")
 FLAVOR_CLIENT = {"_forever_": "forever", "_classic_era_": "era", "_anniversary_": "era"}
-RULESET_SUFFIX = ("PvE", "PvP", "RP", "RPPvP", "Hardcore")   # as M.MarketInfo() in Midas
+RULESET_SUFFIX = ("PvE", "PvP", "RP", "RPPvP", "Hardcore")   # server: SUFFIX_RULESETS
 REALM_MAX = 100                         # server: MAX_REALM_LEN
 WTF_DAYS = 30                           # realm folders changed in the last 30 days
 WTF_MAX_REALMS = 5                      # per flavor, newest first (both factions each)
@@ -1681,7 +1723,7 @@ NONE_RECHECK = 6 * 3600                 # folder/hand market without server data
 PRICE_MAX_QUERIES = 20                  # real export requests per pass (server: 30/min per IP)
 PRICE_FRESH = 29 * 60                   # data asked less than this ago: no new request (30-min cadence)
 _PORTAL_RE = re.compile(r'(?im)^[ \t]*SET[ \t]+portal[ \t]+"?([A-Za-z0-9_-]*)"?')
-_RULESET_TAIL = re.compile(r"([A-Za-z]+)$")
+_RULESET_BY_WORD = {r.lower(): r for r in RULESET_SUFFIX}
 
 
 def _bad_text(s):
@@ -1703,10 +1745,22 @@ def valid_realm_name(name):
             and not _bad_text(name) and "|" not in name)
 
 
+def _ruleset_word(word):
+    return re.sub(r"[^a-z]", "", word.lower())
+
+
 def forever_ruleset(realm):
-    """Ruleset from the realm name suffix, like M.MarketInfo() ("... Realm 7 PvE")."""
-    m = _RULESET_TAIL.search(realm or "")
-    return m.group(1) if m and m.group(1) in RULESET_SUFFIX else "Normal"
+    """Ruleset from the end of the realm name ("... Realm 7 PvE"), read the way the
+    server builds the market key (api/markets.py ruleset_from_realm): last word, any
+    case. The role-play PvP realms are named "... RP PvP" (two words): they are RPPvP
+    with an auction house of their own, not PvP."""
+    words = (realm or "").split()
+    if not words:
+        return "Normal"
+    w = _ruleset_word(words[-1])
+    if w == "pvp" and len(words) > 1 and _ruleset_word(words[-2]) == "rp":
+        return "RPPvP"
+    return _RULESET_BY_WORD.get(w, "Normal")
 
 
 def market_ruleset(client, realm):

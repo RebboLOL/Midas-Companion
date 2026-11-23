@@ -4,6 +4,7 @@ Every test uses its own APPDATA (conftest) and a temporary game folder."""
 import http.client
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -552,6 +553,144 @@ def test_only_wow_skips_detection(own_appdata, tmp_path, monkeypatch):
         for h in list(app.log.handlers):
             h.close()
             app.log.removeHandler(h)
+
+
+def _close_log(app):
+    for h in list(app.log.handlers):
+        h.close()
+        app.log.removeHandler(h)
+
+
+def test_wow_roots_skips_a_drive_that_cannot_be_read(tmp_path, monkeypatch):
+    """23.11.2026 (user report): one drive letter that answers with an error
+    (locked, unreadable, lost network drive) must not end the folder search."""
+    root = tmp_path / "World of Warcraft"
+    (root / "_forever_").mkdir(parents=True)
+    real_stat, real_isdir = os.stat, os.path.isdir
+
+    def stat(p, *a, **kw):                  # what pathlib's exists()/is_dir() run into
+        if str(p).upper().startswith("Q:"):
+            raise OSError(22, "drive cannot be read", str(p), 1005)
+        return real_stat(p, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", stat)
+    monkeypatch.setattr(U, "local_drives", lambda: ["Q"])
+    with pytest.raises(OSError):
+        Path("Q:\\").exists()               # the call the search used before
+    assert U.wow_roots([str(root), "Q:\\World of Warcraft", str(tmp_path / "nope")]) == [root]
+
+    def isdir(p):                           # and should the check itself ever raise
+        if str(p).upper().startswith("Q:"):
+            raise OSError(22, "drive cannot be read", str(p), 1005)
+        return real_isdir(p)
+
+    monkeypatch.setattr(os.path, "isdir", isdir)
+    assert U.is_dir("Q:\\") is False
+    assert U.wow_roots([str(root), "Q:\\World of Warcraft"]) == [root]
+
+
+def test_local_drives_are_letters_of_existing_drives(monkeypatch):
+    letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    drives = U.local_drives()
+    assert drives and all(len(d) == 1 and d in letters for d in drives)
+    assert Path(os.environ["SystemRoot"]).drive[0].upper() in drives
+    import ctypes
+
+    def no_dll(name):
+        raise OSError("kernel32 not available")
+    monkeypatch.setattr(ctypes, "WinDLL", no_dll)
+    assert U.local_drives() == list(letters)        # fallback: every letter
+
+
+def test_state_file_that_is_not_utf8_is_moved_aside(own_appdata):
+    """Review 23.11.2026: such a file raised UnicodeDecodeError on every load."""
+    st = U.load_state()
+    U.save_state(st)
+    f = U.state_file()
+    f.write_bytes(b'{"client_id": "\xff\xfe"}')
+    fresh = U.load_state()
+    assert len(fresh["client_id"]) == 32 and fresh["wow_dirs"] == []
+    assert not f.exists() and list(f.parent.glob("state_corrupt_*.json"))
+
+
+def test_wow_roots_usual_places_on_a_drive(tmp_path, monkeypatch):
+    """Auto-detection without any state: <drive>:\\Program Files (x86)\\World of Warcraft."""
+    real = os.path.isdir
+    fake = tmp_path / "driveq"
+    (fake / "Program Files (x86)" / "World of Warcraft" / "_forever_").mkdir(parents=True)
+
+    def isdir(p):
+        s = str(p)
+        return real(str(fake) + s[2:]) if s.upper().startswith("Q:") else real(p)
+
+    monkeypatch.setattr(os.path, "isdir", isdir)
+    monkeypatch.setattr(U, "local_drives", lambda: ["Q"])
+    assert U.wow_roots([]) == [Path("Q:\\Program Files (x86)\\World of Warcraft")]
+
+
+def test_loop_survives_a_failing_folder_search(own_appdata, tmp_path, monkeypatch):
+    """The background thread used to die when the folder search raised: the window
+    stayed on "folder not found", a folder chosen by hand was confirmed ("Added")
+    but never taken over or saved."""
+    root = tmp_path / "World of Warcraft"
+    (root / "_forever_").mkdir(parents=True)
+    monkeypatch.setattr(U, "local_drives", lambda: [])
+    real, calls = U.wow_roots, []
+
+    def flaky(extra):
+        calls.append(list(extra))
+        if len(calls) == 1:
+            raise OSError(22, "drive cannot be read", "Q:\\", 1005)
+        return real(extra)
+
+    monkeypatch.setattr(U, "wow_roots", flaky)
+    app = T.App("http://127.0.0.1:9/api/v1/snapshots", [], 30, lang="en")
+    th = threading.Thread(target=app.loop, daemon=True)
+    th.start()
+    try:
+        end = time.time() + 10
+        while not calls and time.time() < end:
+            time.sleep(0.02)
+        time.sleep(0.2)
+        assert th.is_alive() and app.roots == []
+        r = app.action("folder", {"path": str(root)})
+        assert r == {"ok": True, "root": str(root.resolve())}
+        while app.roots != [root.resolve()] and time.time() < end:
+            time.sleep(0.02)
+        assert app.roots == [root.resolve()]
+        assert app.status_data()["wow"]["found"] is True
+        assert U.load_state()["wow_dirs"] == [str(root.resolve())]
+    finally:
+        app.stop.set()
+        app.wake.set()
+        th.join(timeout=10)
+        _close_log(app)
+    assert not th.is_alive()
+
+
+def test_picked_folder_counts_even_when_the_state_cannot_be_saved(own_appdata, tmp_path, monkeypatch):
+    root = tmp_path / "World of Warcraft"
+    (root / "_classic_era_").mkdir(parents=True)
+    monkeypatch.setattr(U, "local_drives", lambda: [])
+    app = T.App(U.DEFAULT_URL, [], 30, lang="en")
+    try:
+        assert app.action("folder", {"path": str(root)})["ok"]
+
+        def no_save(st):
+            raise OSError(13, "state is locked")
+        monkeypatch.setattr(U, "save_state", no_save)
+        with pytest.raises(OSError):
+            app._apply_dir_requests()
+        assert app.watcher is None and app.find_roots() == [root.resolve()]
+        # locked state file (save_state -> False): the choice rides along in the
+        # watcher's state and is written with its next save
+        monkeypatch.setattr(U, "save_state", lambda st: False)
+        monkeypatch.setattr(U.Watcher, "step", lambda self, force=False: 30)
+        assert U.load_state()["wow_dirs"] == []
+        assert app._pass() == 30
+        assert app.roots == [root.resolve()] and app.watcher.st["wow_dirs"] == [str(root.resolve())]
+    finally:
+        _close_log(app)
 
 
 def test_ring_log_and_texts(own_appdata):

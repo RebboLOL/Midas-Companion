@@ -155,6 +155,64 @@ def test_ruleset_from_realm_suffix():
     assert U.market_ruleset("era", "Plain Realm PvP") is None
 
 
+@pytest.mark.parametrize("realm,ruleset", [
+    ("Test EU4 Realm 9 RP PvP", "RPPvP"),          # role-play PvP: two words, own auction house
+    ("Test US1 Realm 12 RP PVP", "RPPvP"),
+    ("Test EU4 Realm 9 rp pvp", "RPPvP"),
+    ("Test EU4 Realm 9 RP  PvP", "RPPvP"),
+    ("RP PvP", "RPPvP"),
+    ("Test EU4 Realm 9 RP-PvP", "RPPvP"),
+    ("Test EU4 Realm 9 RPPvP", "RPPvP"),
+    ("Test EU5 Realm 10 RP", "RP"),
+    ("Test US1 Realm 8 PvP", "PvP"),
+    ("PvP", "PvP"),
+    ("Test EU5 Realm 7 RP PvE", "PvE"),            # only RP + PvP belong together
+    ("Test EU5 Realm 7 Harp PvP", "PvP"),          # whole word, not a word ending
+    ("Test EU5 Realm 7 PvP RP", "RP"),
+    ("Test EU5 Realm 7 pve", "PvE"),               # any case, like the server
+    ("Test EU5 Realm 9", "Normal"),
+    ("", "Normal"),
+    (None, "Normal"),
+])
+def test_ruleset_two_word_suffix(realm, ruleset):
+    assert U.forever_ruleset(realm) == ruleset
+    assert U.market_ruleset("forever", realm) == ruleset
+    assert U.market_ruleset("era", realm) is None
+
+
+def test_rp_pvp_folder_and_pvp_folder_are_two_markets(tmp_path):
+    base = tmp_path / "_forever_"
+    realm_dir(base, "Test EU4 Realm 2 PvP")
+    realm_dir(base, "Test EU4 Realm 9 RP PvP")
+    config(base, 'SET portal "EU"\n')
+    out, _info = U.extra_markets(tmp_path, "_forever_", [])
+    assert {(m["realm"], m["ruleset"]) for m in out} == {
+        ("Test EU4 Realm 2 PvP", "PvP"), ("Test EU4 Realm 9 RP PvP", "RPPvP")}
+    assert len({U.raw_key(m) for m in out}) == 4            # both factions each, never merged
+    q = dict(U.export_params(next(m for m in out if m["ruleset"] == "RPPvP")))
+    assert q["realm"] == "Test EU4 Realm 9 RP PvP" and q["ruleset"] == "RPPvP"
+    assert len({U.query_key("http://127.0.0.1:1/api/v1/export", m) for m in out}) == 4
+
+
+def test_manual_rp_pvp_market_asks_for_rppvp(tmp_path, xs):
+    root = tmp_path / "wow"
+    _, midas = new_user(root, flavor="_forever_", realms=(), portal=None)
+    st = U.load_state()
+    lst = U.add_manual_market([], {"flavor": "_forever_", "region": "EU",
+                                   "realm": "Test EU4 Realm 9 RP PvP", "faction": "Horde"})
+    st["manual_markets"] = U.add_manual_market(lst, {"flavor": "_forever_", "region": "EU",
+                                                     "realm": "Test EU4 Realm 2 PvP", "faction": "Horde"})
+    xs.markets[("forever", "EU", "Test EU4 Realm 9 RP PvP", "Horde")] = export("forever/EU/rppvp/horde")
+    xs.markets[("forever", "EU", "Test EU4 Realm 2 PvP", "Horde")] = export("forever/EU/pvp/horde")
+    res, _ = U.run_prices([root], xs.url, st, logger()[1])
+    assert res == U.PASS_OK
+    assert sorted((q["realm"], q["ruleset"]) for q in gets(xs)) == [
+        ("Test EU4 Realm 2 PvP", "PvP"), ("Test EU4 Realm 9 RP PvP", "RPPvP")]
+    got = {x["market"]: [m["realm"] for m in x["match"]] for x in lua_markets(lua_load(midas / "Prices.lua"))}
+    assert got == {"forever/EU/pvp/horde": ["Test EU4 Realm 2 PvP"],
+                   "forever/EU/rppvp/horde": ["Test EU4 Realm 9 RP PvP"]}
+
+
 # --------------------------------------------------------------------------- #
 # market list: seen first, both factions, limits
 # --------------------------------------------------------------------------- #
