@@ -1,6 +1,6 @@
 # Midas Companion
 
-Source code of **Midas Companion** 1.3.2, the Windows companion app for the World of Warcraft addon
+Source code of **Midas Companion** 1.3.3, the Windows companion app for the World of Warcraft addon
 **[Midas](https://www.curseforge.com/wow/addons/midas)** and the website **[midasmarket.app](https://midasmarket.app)**.
 
 This is the code the Microsoft Store app is built from. It is published so that everyone can read what

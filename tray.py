@@ -24,6 +24,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 
 import package_env
@@ -149,8 +150,94 @@ def autostart_enabled():
     return startup_link().exists()
 
 
-def _ps_quote(s):
-    return "'" + str(s).replace("'", "''") + "'"
+# --------------------------------------------------------------------------- #
+# Shortcut via IShellLinkW + IPersistFile, in process (no helper process)
+# --------------------------------------------------------------------------- #
+CLSID_SHELLLINK = "00021401-0000-0000-c000-000000000046"
+IID_ISHELLLINKW = "000214f9-0000-0000-c000-000000000046"
+IID_IPERSISTFILE = "0000010b-0000-0000-c000-000000000046"
+COINIT_APARTMENTTHREADED = 0x2
+CLSCTX_INPROC_SERVER = 0x1
+# IShellLinkW slots: 7 SetDescription, 9 SetWorkingDirectory, 11 SetArguments, 20 SetPath
+# IPersistFile slots: 6 Save
+SHORTCUT_TIMEOUT = 15.0
+_lnk_lock = threading.Lock()      # one shortcut write at a time, late writers included
+_want = {"on": None}              # last autostart choice (a late write follows it)
+
+
+def _com_thread(fn, timeout=None):
+    """Run fn(ole32) on a fresh STA thread (independent of the tray's apartment).
+    On timeout TimeoutError is raised; the thread may still finish later."""
+    out = {}
+
+    def run():
+        ole, hr = None, -1
+        try:
+            ole = ctypes.WinDLL("ole32")
+            ole.CoInitializeEx.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+            ole.CoInitializeEx.restype = package_env.HRESULT
+            ole.CoCreateInstance.argtypes = [ctypes.POINTER(package_env._GUID), ctypes.c_void_p,
+                                             wintypes.DWORD, ctypes.POINTER(package_env._GUID),
+                                             ctypes.POINTER(ctypes.c_void_p)]
+            ole.CoCreateInstance.restype = package_env.HRESULT
+            ole.CoUninitialize.argtypes = []
+            ole.CoUninitialize.restype = None
+            hr = ole.CoInitializeEx(None, COINIT_APARTMENTTHREADED)
+            out["value"] = fn(ole)
+        except Exception as e:  # noqa: BLE001 -- handed to the caller
+            out["error"] = e
+        finally:
+            if ole is not None and hr >= 0:
+                ole.CoUninitialize()
+
+    th = threading.Thread(target=run, daemon=True, name="midas-shortcut")
+    th.start()
+    th.join(SHORTCUT_TIMEOUT if timeout is None else timeout)
+    if th.is_alive():
+        raise TimeoutError("shortcut: timed out")
+    if "error" in out:
+        raise out["error"]
+    return out.get("value")
+
+
+def write_shortcut(lnk, target, args="", workdir="", description=""):
+    """Write the .lnk `lnk` (raises OSError/TimeoutError on failure). The shortcut
+    is removed again when the last autostart choice is "off" by the time the write
+    finishes (a slow write after a timeout, or "off" chosen meanwhile)."""
+    P = package_env
+
+    def run(ole):
+        with _lnk_lock:
+            _write(ole)
+            if _want["on"] is False:
+                try:
+                    Path(lnk).unlink()
+                except OSError:
+                    pass
+
+    def _write(ole):
+        link = ctypes.c_void_p()
+        pf = ctypes.c_void_p()
+        try:
+            clsid, iid = P._guid(CLSID_SHELLLINK), P._guid(IID_ISHELLLINKW)
+            P._check(ole.CoCreateInstance(ctypes.byref(clsid), None, CLSCTX_INPROC_SERVER,
+                                          ctypes.byref(iid), ctypes.byref(link)),
+                     "CoCreateInstance(ShellLink)")
+            for slot, value, what in ((20, target, "SetPath"), (11, args, "SetArguments"),
+                                      (9, workdir, "SetWorkingDirectory"),
+                                      (7, description, "SetDescription")):
+                P._check(P._vcall(link, slot, P.HRESULT, ctypes.c_wchar_p, str(value)), what)
+            iid_pf = P._guid(IID_IPERSISTFILE)
+            P._check(P._vcall(link, 0, P.HRESULT, ctypes.POINTER(P._GUID), ctypes.byref(iid_pf),
+                              ctypes.POINTER(ctypes.c_void_p), ctypes.byref(pf)),
+                     "QueryInterface(IPersistFile)")
+            P._check(P._vcall(pf, 6, P.HRESULT, ctypes.c_wchar_p, str(lnk), wintypes.BOOL, True),
+                     "IPersistFile.Save")
+        finally:
+            P._release(pf)
+            P._release(link)
+
+    _com_thread(run)
 
 
 def set_autostart(on):
@@ -163,23 +250,30 @@ def set_autostart(on):
         _task_state["on"] = st in (package_env.ENABLED, package_env.ENABLED_BY_POLICY)
         return _task_state["on"] == on
     lnk = startup_link()
+    _want["on"] = bool(on)
     if not on:
         try:
             lnk.unlink()
         except FileNotFoundError:
             pass
+        except OSError as e:                      # e.g. held open by a scanner
+            logging.getLogger("midasuplink").warning(f"autostart shortcut not removed: {e}")
+            return False
         return True
-    lnk.parent.mkdir(parents=True, exist_ok=True)
     target, args = launch_target()
-    script = ("$s=(New-Object -ComObject WScript.Shell).CreateShortcut(" + _ps_quote(lnk) + ");"
-              "$s.TargetPath=" + _ps_quote(target) + ";"
-              "$s.Arguments=" + _ps_quote(args) + ";"
-              "$s.WorkingDirectory=" + _ps_quote(Path(target).parent) + ";"
-              "$s.Description=" + _ps_quote(APP_NAME) + ";"
-              "$s.Save()")
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    return r.returncode == 0 and lnk.exists()
+    existed = lnk.exists()
+    try:
+        lnk.parent.mkdir(parents=True, exist_ok=True)
+        write_shortcut(lnk, target, args, Path(target).parent, APP_NAME)
+    except Exception as e:  # noqa: BLE001 -- menu and window threads must survive
+        logging.getLogger("midasuplink").warning(f"autostart shortcut not written: {e}")
+        if not existed:                           # no half-written shortcut left behind
+            try:
+                lnk.unlink()
+            except OSError:
+                pass
+        return False
+    return lnk.exists()
 
 
 def resource(*parts):

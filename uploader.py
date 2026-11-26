@@ -93,7 +93,7 @@ import uuid
 import zlib
 from pathlib import Path
 
-VERSION = "1.3.2"
+VERSION = "1.3.3"
 APP_NAME = "Midas Companion"
 DEFAULT_URL = "https://midasmarket.app/api/v1/snapshots"
 LOCAL_URL = "http://127.0.0.1:8000/api/v1/snapshots"     # 0.1.0/0.2.0 default

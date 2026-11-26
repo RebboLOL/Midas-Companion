@@ -116,7 +116,7 @@ def test_payload_of_price_scan_and_full_unchanged():
     assert b["snapshot"]["items"] == {"1": "5,100", "7": "0,3"} and b["snapshot"]["count"] == 2
     assert b["snapshot"]["market"] == {"client": "forever", "region": "EU", "realm": "R",
                                        "faction": "Horde", "ruleset": "PvE"}
-    assert b["format"] == 1 and b["uploader"] == U.VERSION == "1.3.2"
+    assert b["format"] == 1 and b["uploader"] == U.VERSION == "1.3.3"
     full = {"v": 1, "ts": 5, "market": p["market"], "items": {1: "1,1,5,1,1"}}
     fb = U.payload(full, "a" * 32)
     assert "kind" not in fb and "kind" not in fb["snapshot"]
